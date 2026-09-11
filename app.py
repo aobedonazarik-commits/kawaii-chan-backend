@@ -28,7 +28,7 @@ def test():
 
 @app.route("/webapp", methods=["POST"])
 def webapp():
-    data = request.json
+    data = request.json or {}
 
     return jsonify({
         "success": True,
@@ -37,7 +37,6 @@ def webapp():
     })
 
 
-# Публикация текста в Telegram-канал
 @app.route("/publish", methods=["POST"])
 def publish():
     data = request.json or {}
@@ -56,7 +55,7 @@ def publish():
             "message": "BOT_TOKEN не найден в настройках Backend."
         }), 500
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     payload = {
         "chat_id": CHANNEL_USERNAME,
@@ -65,7 +64,7 @@ def publish():
 
     try:
         response = requests.post(
-            url,
+            telegram_url,
             json=payload,
             timeout=20
         )
@@ -75,8 +74,7 @@ def publish():
         if result.get("ok"):
             return jsonify({
                 "success": True,
-                "message": "Пост успешно опубликован!",
-                "telegram": result
+                "message": "Пост успешно опубликован!"
             })
 
         return jsonify({
