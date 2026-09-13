@@ -1,11 +1,10 @@
 import os
 import json
-import time
-import uuid
 import sqlite3
-import mimetypes
 import threading
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from flask import Flask, request, jsonify
@@ -16,41 +15,41 @@ from flask_cors import CORS
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-CHANNEL_USERNAME = os.getenv(
+CHANNEL_USERNAME = os.environ.get(
     "CHANNEL_USERNAME",
     "@ahegao_hetai_hub"
 ).strip()
 
-# Наш существующий закрытый Storage-канал
-STORAGE_CHAT_ID = os.getenv(
+STORAGE_CHAT_ID = os.environ.get(
     "STORAGE_CHAT_ID",
     "-1003992513200"
 ).strip()
 
-DB_PATH = os.getenv(
+DB_PATH = os.environ.get(
     "DB_PATH",
-    "kawaii.db"
+    "kawaii_chan.db"
 )
 
-UPLOAD_DIR = os.getenv(
-    "UPLOAD_DIR",
-    "/tmp/kawaii_uploads"
+UPLOAD_DIR = Path(
+    os.environ.get(
+        "UPLOAD_DIR",
+        "/tmp/kawaii_uploads"
+    )
 )
 
-PORT = int(os.getenv("PORT", "10000"))
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
 MAX_MEDIA = 100
-MAX_MEDIA_PER_ALBUM = 10
-
-SCHEDULER_INTERVAL = 20
-
-MAX_TEXT_LENGTH = 4096
-MAX_CAPTION_LENGTH = 1024
-
-# Telegram Bot API sendVideo currently allows files up to 50 MB.
 MAX_VIDEO_SIZE = 50 * 1024 * 1024
+
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}"
+)
 
 
 # ============================================================
@@ -58,17 +57,7 @@ MAX_VIDEO_SIZE = 50 * 1024 * 1024
 # ============================================================
 
 app = Flask(__name__)
-
-CORS(
-    app,
-    resources={
-        r"/*": {
-            "origins": "*"
-        }
-    }
-)
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+CORS(app)
 
 
 # ============================================================
@@ -79,89 +68,49 @@ db_lock = threading.Lock()
 
 
 def get_db():
-    connection = sqlite3.connect(
+    conn = sqlite3.connect(
         DB_PATH,
+        timeout=30,
         check_same_thread=False
     )
 
-    connection.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row
 
-    return connection
+    return conn
 
 
 def init_db():
+
     with db_lock:
-        db = get_db()
 
-        cursor = db.cursor()
+        conn = get_db()
 
-        cursor.execute("""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT DEFAULT '',
+                run_at TEXT NOT NULL,
+                media_json TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                published_at TEXT,
+                error TEXT
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_message_ids TEXT NOT NULL,
-                text TEXT,
-                media_count INTEGER DEFAULT 0,
-                photo_count INTEGER DEFAULT 0,
-                video_count INTEGER DEFAULT 0,
+                telegram_message_ids TEXT DEFAULT '[]',
+                text TEXT DEFAULT '',
+                media_json TEXT DEFAULT '[]',
                 post_type TEXT DEFAULT 'text',
                 created_at TEXT NOT NULL
             )
         """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT,
-                run_at TEXT NOT NULL,
-                media_json TEXT,
-                status TEXT DEFAULT 'pending',
-                error TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        db.commit()
-
-        # Мягкая миграция старой таблицы scheduled
-        columns = db.execute(
-            "PRAGMA table_info(scheduled)"
-        ).fetchall()
-
-        column_names = {
-            column["name"]
-            for column in columns
-        }
-
-        if "media_json" not in column_names:
-            db.execute("""
-                ALTER TABLE scheduled
-                ADD COLUMN media_json TEXT
-            """)
-
-        # Мягкая миграция старой таблицы posts
-        post_columns = db.execute(
-            "PRAGMA table_info(posts)"
-        ).fetchall()
-
-        post_column_names = {
-            column["name"]
-            for column in post_columns
-        }
-
-        if "media_count" not in post_column_names:
-            db.execute("""
-                ALTER TABLE posts
-                ADD COLUMN media_count INTEGER DEFAULT 0
-            """)
-
-        if "video_count" not in post_column_names:
-            db.execute("""
-                ALTER TABLE posts
-                ADD COLUMN video_count INTEGER DEFAULT 0
-            """)
-
-        db.commit()
-        db.close()
+        conn.commit()
+        conn.close()
 
 
 init_db()
@@ -171,33 +120,20 @@ init_db()
 # HELPERS
 # ============================================================
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
 def now_iso():
-    return now_utc().isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-def parse_iso_datetime(value):
-    try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-    except Exception:
-        return None
+def telegram(method, payload=None, files=None):
 
-
-def telegram_api(
-    method,
-    data=None,
-    files=None,
-    timeout=120
-):
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN не найден в настройках Render."
-        )
+
+        return {
+            "ok": False,
+            "error": "BOT_TOKEN не настроен."
+        }
 
     url = (
         f"https://api.telegram.org/"
@@ -205,846 +141,782 @@ def telegram_api(
     )
 
     try:
+
         response = requests.post(
             url,
-            data=data,
+            data=payload,
             files=files,
-            timeout=timeout
+            timeout=120
         )
-    except requests.RequestException as error:
-        raise RuntimeError(
-            f"Ошибка соединения с Telegram: {error}"
-        )
+
+        try:
+            return response.json()
+
+        except Exception:
+
+            return {
+                "ok": False,
+                "error":
+                    f"Telegram вернул HTTP "
+                    f"{response.status_code}"
+            }
+
+    except requests.RequestException as exc:
+
+        return {
+            "ok": False,
+            "error":
+                f"Ошибка соединения с Telegram: {exc}"
+        }
+
+
+def safe_json(value, default):
 
     try:
-        payload = response.json()
+
+        return json.loads(value)
+
     except Exception:
-        raise RuntimeError(
-            "Telegram вернул некорректный ответ: "
-            + response.text[:500]
-        )
 
-    if not payload.get("ok"):
-        raise RuntimeError(
-            payload.get(
-                "description",
-                "Неизвестная ошибка Telegram API."
-            )
-        )
+        return default
 
-    return payload.get("result")
+
+def save_temp_file(file):
+
+    if not file or not file.filename:
+
+        return None
+
+    filename = os.path.basename(
+        file.filename
+    )
+
+    timestamp = str(
+        int(time.time() * 1000000)
+    )
+
+    path = (
+        UPLOAD_DIR /
+        f"{timestamp}_{filename}"
+    )
+
+    file.save(path)
+
+    return path
 
 
 def cleanup_files(paths):
+
     for path in paths:
+
         try:
-            if os.path.exists(path):
-                os.remove(path)
+
+            Path(path).unlink(
+                missing_ok=True
+            )
+
         except Exception:
+
             pass
 
 
-def detect_media_type(path):
-    mime_type = (
-        mimetypes.guess_type(path)[0]
-        or ""
-    ).lower()
-
-    if mime_type.startswith("video/"):
-        return "video"
-
-    return "photo"
-
-
-def validate_text(text):
-    if len(text) > MAX_TEXT_LENGTH:
-        raise RuntimeError(
-            "Текст слишком длинный. "
-            "Максимум — 4096 символов."
-        )
-
-
 # ============================================================
-# STORAGE CHANNEL
+# TELEGRAM STORAGE
 # ============================================================
-
-def storage_chat_id():
-    if not STORAGE_CHAT_ID:
-        raise RuntimeError(
-            "STORAGE_CHAT_ID не настроен в Render."
-        )
-
-    return STORAGE_CHAT_ID
-
 
 def save_photo_to_storage(path):
-    filename = os.path.basename(path)
 
-    mime_type = (
-        mimetypes.guess_type(filename)[0]
-        or "image/jpeg"
-    )
+    with open(path, "rb") as photo:
 
-    with open(path, "rb") as media_file:
-
-        result = telegram_api(
+        result = telegram(
             "sendPhoto",
-            data={
-                "chat_id": storage_chat_id()
+            payload={
+                "chat_id": STORAGE_CHAT_ID,
+                "disable_notification": "true"
             },
             files={
                 "photo": (
-                    filename,
-                    media_file,
-                    mime_type
+                    Path(path).name,
+                    photo,
+                    "application/octet-stream"
                 )
             }
         )
 
-    photo = result.get("photo") or []
+    if not result.get("ok"):
 
-    if not photo:
         raise RuntimeError(
-            "Telegram не вернул информацию о сохранённом фото."
+            result.get(
+                "description",
+                "Telegram не принял фото."
+            )
         )
 
-    # Самый большой размер фото
-    best = photo[-1]
+    message = result["result"]
+
+    photos = message.get(
+        "photo",
+        []
+    )
+
+    if not photos:
+
+        raise RuntimeError(
+            "Telegram не вернул file_id фотографии."
+        )
+
+    file_id = photos[-1]["file_id"]
 
     return {
         "type": "photo",
-        "file_id": best["file_id"],
-        "storage_message_id": result["message_id"]
+        "file_id": file_id,
+        "storage_message_id":
+            message.get("message_id")
     }
 
 
 def save_video_to_storage(path):
-    filename = os.path.basename(path)
 
-    file_size = os.path.getsize(path)
+    size = Path(path).stat().st_size
 
-    if file_size > MAX_VIDEO_SIZE:
+    if size > MAX_VIDEO_SIZE:
+
         raise RuntimeError(
-            "Видео слишком большое. "
-            "Максимальный размер — 50 МБ."
+            "Видео больше 50 МБ."
         )
 
-    mime_type = (
-        mimetypes.guess_type(filename)[0]
-        or "video/mp4"
-    )
+    with open(path, "rb") as video:
 
-    with open(path, "rb") as media_file:
-
-        result = telegram_api(
+        result = telegram(
             "sendVideo",
-            data={
-                "chat_id": storage_chat_id(),
-                "supports_streaming": "true"
+            payload={
+                "chat_id": STORAGE_CHAT_ID,
+                "supports_streaming": "true",
+                "disable_notification": "true"
             },
             files={
                 "video": (
-                    filename,
-                    media_file,
-                    mime_type
+                    Path(path).name,
+                    video,
+                    "video/mp4"
                 )
-            },
-            timeout=180
+            }
         )
 
-    file_id = (
-        result.get("video", {})
-        .get("file_id")
+    if not result.get("ok"):
+
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram не принял видео."
+            )
+        )
+
+    message = result["result"]
+
+    video_data = message.get(
+        "video"
     )
 
-    if not file_id:
+    if not video_data:
+
         raise RuntimeError(
             "Telegram не вернул file_id видео."
         )
 
     return {
         "type": "video",
-        "file_id": file_id,
-        "storage_message_id": result["message_id"]
+        "file_id":
+            video_data["file_id"],
+        "storage_message_id":
+            message.get("message_id")
     }
 
 
-def save_media_to_storage(path):
-    media_type = detect_media_type(path)
+def save_media_to_storage(
+    path,
+    media_type
+):
 
     if media_type == "video":
-        return save_video_to_storage(path)
 
-    return save_photo_to_storage(path)
-
-
-def save_media_files_to_storage(paths):
-    result = []
-
-    for path in paths:
-
-        if not os.path.exists(path):
-            raise RuntimeError(
-                f"Файл не найден: {os.path.basename(path)}"
-            )
-
-        saved = save_media_to_storage(path)
-
-        result.append(saved)
-
-    return result
-
-
-# ============================================================
-# TELEGRAM PUBLISHING
-# ============================================================
-
-def publish_text(text):
-    text = (text or "").strip()
-
-    if not text:
-        raise RuntimeError(
-            "Текст публикации пустой."
+        return save_video_to_storage(
+            path
         )
 
-    validate_text(text)
-
-    result = telegram_api(
-        "sendMessage",
-        data={
-            "chat_id": CHANNEL_USERNAME,
-            "text": text
-        }
+    return save_photo_to_storage(
+        path
     )
 
-    return [
-        result["message_id"]
-    ]
 
+# ============================================================
+# REQUEST MEDIA
+# ============================================================
+
+def get_uploaded_media():
+
+    files = []
+
+    # Новый интерфейс отправляет "photos".
+    files.extend(
+        request.files.getlist(
+            "photos"
+        )
+    )
+
+    # Также поддерживаем "media".
+    files.extend(
+        request.files.getlist(
+            "media"
+        )
+    )
+
+    # Убираем дубликаты объектов.
+    unique = []
+
+    seen = set()
+
+    for item in files:
+
+        marker = id(item)
+
+        if marker not in seen:
+
+            seen.add(marker)
+            unique.append(item)
+
+    return unique
+
+
+def upload_request_media_to_storage():
+
+    incoming = get_uploaded_media()
+
+    if len(incoming) > MAX_MEDIA:
+
+        raise RuntimeError(
+            f"Можно загрузить максимум "
+            f"{MAX_MEDIA} файлов."
+        )
+
+    temp_paths = []
+    stored_media = []
+
+    try:
+
+        for file in incoming:
+
+            content_type = (
+                file.content_type or ""
+            ).lower()
+
+            if content_type.startswith(
+                "video/"
+            ):
+
+                media_type = "video"
+
+            elif content_type.startswith(
+                "image/"
+            ):
+
+                media_type = "photo"
+
+            else:
+
+                raise RuntimeError(
+                    f"Неподдерживаемый тип файла: "
+                    f"{content_type or 'неизвестный'}"
+                )
+
+            path = save_temp_file(
+                file
+            )
+
+            if not path:
+
+                continue
+
+            temp_paths.append(path)
+
+            stored = save_media_to_storage(
+                path,
+                media_type
+            )
+
+            stored_media.append(
+                stored
+            )
+
+        return stored_media
+
+    finally:
+
+        cleanup_files(
+            temp_paths
+        )
+
+
+# ============================================================
+# PUBLISH MEDIA
+# ============================================================
 
 def publish_media_group(
-    media_items,
+    media,
     caption=""
 ):
-    if not media_items:
-        return []
 
-    if len(media_items) > MAX_MEDIA_PER_ALBUM:
-        raise RuntimeError(
-            "В одной группе Telegram может быть "
-            "максимум 10 медиа."
-        )
+    telegram_media = []
 
-    media = []
+    for index, item in enumerate(media):
 
-    for index, item in enumerate(media_items):
+        media_type = item["type"]
 
-        media_type = item.get("type")
-        file_id = item.get("file_id")
+        if media_type == "photo":
 
-        if not file_id:
-            raise RuntimeError(
-                "У медиа отсутствует file_id."
-            )
+            obj = {
+                "type": "photo",
+                "media": item["file_id"]
+            }
 
-        if media_type == "video":
-            telegram_type = "video"
+        elif media_type == "video":
+
+            obj = {
+                "type": "video",
+                "media": item["file_id"],
+                "supports_streaming": True
+            }
+
         else:
-            telegram_type = "photo"
 
-        entry = {
-            "type": telegram_type,
-            "media": file_id
-        }
+            continue
 
         if index == 0 and caption:
-            entry["caption"] = (
-                caption[:MAX_CAPTION_LENGTH]
-            )
 
-        media.append(entry)
+            obj["caption"] = caption
+            obj["parse_mode"] = "HTML"
 
-    result = telegram_api(
+        telegram_media.append(
+            obj
+        )
+
+    if not telegram_media:
+
+        return {
+            "ok": False,
+            "description":
+                "Нет поддерживаемых медиа."
+        }
+
+    return telegram(
         "sendMediaGroup",
-        data={
-            "chat_id": CHANNEL_USERNAME,
-            "media": json.dumps(
-                media,
-                ensure_ascii=False
-            )
-        },
-        timeout=180
+        payload={
+            "chat_id":
+                CHANNEL_USERNAME,
+            "media":
+                json.dumps(
+                    telegram_media,
+                    ensure_ascii=False
+                )
+        }
     )
-
-    message_ids = []
-
-    for message in result:
-
-        if "message_id" in message:
-            message_ids.append(
-                message["message_id"]
-            )
-
-    return message_ids
 
 
 def publish_stored_media(
-    media_items,
+    media,
     text=""
 ):
-    if not media_items:
-        return publish_text(text)
 
-    if len(media_items) > MAX_MEDIA:
-        raise RuntimeError(
-            f"Максимум за одну публикацию: "
-            f"{MAX_MEDIA} медиа."
+    if not media:
+
+        result = telegram(
+            "sendMessage",
+            payload={
+                "chat_id":
+                    CHANNEL_USERNAME,
+                "text":
+                    text,
+                "parse_mode":
+                    "HTML"
+            }
         )
 
-    validate_text(text or "")
+        if not result.get("ok"):
 
-    groups = []
+            raise RuntimeError(
+                result.get(
+                    "description",
+                    "Не удалось отправить текст."
+                )
+            )
 
-    for index in range(
-        0,
-        len(media_items),
-        MAX_MEDIA_PER_ALBUM
-    ):
-        groups.append(
-            media_items[
-                index:index + MAX_MEDIA_PER_ALBUM
-            ]
-        )
+        return [
+            result["result"]["message_id"]
+        ]
 
     message_ids = []
 
-    first_caption = (
-        text[:MAX_CAPTION_LENGTH]
-        if text
-        else ""
-    )
+    # Telegram sendMediaGroup максимум 10.
+    groups = [
+        media[i:i + 10]
+        for i in range(
+            0,
+            len(media),
+            10
+        )
+    ]
 
     for group_index, group in enumerate(groups):
 
-        caption = ""
+        caption = (
+            text
+            if group_index == 0
+            else ""
+        )
 
-        if group_index == 0:
-            caption = first_caption
-
-        ids = publish_media_group(
+        result = publish_media_group(
             group,
             caption
         )
 
-        message_ids.extend(ids)
+        if not result.get("ok"):
 
-        if group_index < len(groups) - 1:
-            time.sleep(1)
-
-    # Если текст длиннее лимита подписи —
-    # оставшуюся часть отправляем отдельным сообщением.
-    if len(text) > MAX_CAPTION_LENGTH:
-
-        remainder = text[
-            MAX_CAPTION_LENGTH:
-        ]
-
-        while remainder:
-
-            part = remainder[
-                :MAX_TEXT_LENGTH
-            ]
-
-            result = telegram_api(
-                "sendMessage",
-                data={
-                    "chat_id": CHANNEL_USERNAME,
-                    "text": part
-                }
+            raise RuntimeError(
+                result.get(
+                    "description",
+                    "Не удалось опубликовать медиа."
+                )
             )
+
+        for message in result["result"]:
 
             message_ids.append(
-                result["message_id"]
+                message["message_id"]
             )
 
-            remainder = remainder[
-                MAX_TEXT_LENGTH:
-            ]
+        # Маленькая пауза между альбомами.
+        if group_index < len(groups) - 1:
+
+            time.sleep(0.5)
 
     return message_ids
 
 
 # ============================================================
-# POST HISTORY
+# HISTORY
 # ============================================================
 
-def save_post_record(
+def save_post_history(
     message_ids,
     text,
-    media_count,
-    photo_count,
-    video_count,
-    post_type
+    media
 ):
+
+    if media:
+
+        post_type = "media"
+
+    else:
+
+        post_type = "text"
+
     with db_lock:
 
-        db = get_db()
+        conn = get_db()
 
-        db.execute(
+        conn.execute(
             """
             INSERT INTO posts
             (
                 telegram_message_ids,
                 text,
-                media_count,
-                photo_count,
-                video_count,
+                media_json,
                 post_type,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 json.dumps(
                     message_ids
                 ),
                 text,
-                media_count,
-                photo_count,
-                video_count,
+                json.dumps(
+                    media,
+                    ensure_ascii=False
+                ),
                 post_type,
                 now_iso()
             )
         )
 
-        db.commit()
-        db.close()
-
-
-def publish_stored_post(
-    text,
-    media_items
-):
-    text = (text or "").strip()
-
-    if not text and not media_items:
-        raise RuntimeError(
-            "Нельзя опубликовать пустой пост."
-        )
-
-    if media_items:
-
-        message_ids = publish_stored_media(
-            media_items,
-            text
-        )
-
-        photo_count = sum(
-            1
-            for item in media_items
-            if item.get("type") == "photo"
-        )
-
-        video_count = sum(
-            1
-            for item in media_items
-            if item.get("type") == "video"
-        )
-
-        if video_count and photo_count:
-            post_type = "mixed"
-        elif video_count:
-            post_type = "video"
-        else:
-            post_type = "photo"
-
-        save_post_record(
-            message_ids,
-            text,
-            len(media_items),
-            photo_count,
-            video_count,
-            post_type
-        )
-
-        return message_ids
-
-    message_ids = publish_text(text)
-
-    save_post_record(
-        message_ids,
-        text,
-        0,
-        0,
-        0,
-        "text"
-    )
-
-    return message_ids
+        conn.commit()
+        conn.close()
 
 
 # ============================================================
-# FILE UPLOADS
+# ROUTE: HOME
 # ============================================================
 
-def save_uploaded_media(files):
-
-    saved_paths = []
-
-    if len(files) > MAX_MEDIA:
-        raise RuntimeError(
-            f"Можно выбрать максимум "
-            f"{MAX_MEDIA} файлов."
-        )
-
-    for file in files:
-
-        if not file:
-            continue
-
-        original_name = (
-            file.filename
-            or "media"
-        )
-
-        extension = os.path.splitext(
-            original_name
-        )[1].lower()
-
-        if not extension:
-            extension = ".jpg"
-
-        unique_name = (
-            f"{uuid.uuid4().hex}"
-            f"{extension}"
-        )
-
-        path = os.path.join(
-            UPLOAD_DIR,
-            unique_name
-        )
-
-        file.save(path)
-
-        saved_paths.append(path)
-
-    return saved_paths
-
-
-# ============================================================
-# ROOT
-# ============================================================
-
-@app.route("/", methods=["GET"])
-def root():
+@app.get("/")
+def home():
 
     return jsonify({
         "ok": True,
-        "service": "Kawaii Chan Backend",
-        "status": "online",
-        "channel": CHANNEL_USERNAME,
-        "storage_chat_id": STORAGE_CHAT_ID,
-        "time": now_iso()
+        "service":
+            "Kawaii Chan Backend",
+        "status":
+            "online",
+        "channel":
+            CHANNEL_USERNAME,
+        "storage_chat_id":
+            STORAGE_CHAT_ID,
+        "time":
+            now_iso()
     })
 
 
 # ============================================================
-# TEST
+# ROUTE: TEST
 # ============================================================
 
-@app.route("/test", methods=["GET"])
+@app.get("/test")
 def test():
 
-    if not BOT_TOKEN:
-        return jsonify({
-            "ok": False,
-            "error": "BOT_TOKEN не найден."
-        }), 500
+    result = telegram(
+        "getMe"
+    )
 
-    try:
-
-        result = telegram_api(
-            "getMe"
-        )
-
-        return jsonify({
-            "ok": True,
-            "message": "Бэкэнд подключен.",
-            "bot": {
-                "id": result.get("id"),
-                "username": result.get("username"),
-                "first_name": result.get("first_name")
-            },
-            "channel": CHANNEL_USERNAME,
-            "storage_chat_id": STORAGE_CHAT_ID
-        })
-
-    except Exception as error:
+    if not result.get("ok"):
 
         return jsonify({
             "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# STORAGE TEST
-# ============================================================
-
-@app.route("/storage-test", methods=["GET"])
-def storage_test():
-
-    try:
-
-        result = telegram_api(
-            "sendMessage",
-            data={
-                "chat_id": storage_chat_id(),
-                "text": (
-                    "Kawaii Chan Storage подключён.\n"
-                    "Тест Backend: OK."
+            "error":
+                result.get(
+                    "description",
+                    "Bot API error"
                 )
-            }
-        )
-
-        return jsonify({
-            "ok": True,
-            "message": "Storage-канал работает.",
-            "storage_chat_id": STORAGE_CHAT_ID,
-            "message_id": result["message_id"]
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
         }), 500
-
-
-# ============================================================
-# WEBAPP
-# ============================================================
-
-@app.route("/webapp", methods=["GET"])
-def webapp():
 
     return jsonify({
         "ok": True,
-        "message": (
-            "Kawaii Chan Web App backend работает."
-        )
+        "bot": result["result"],
+        "channel":
+            CHANNEL_USERNAME,
+        "storage_chat_id":
+            STORAGE_CHAT_ID
     })
 
 
 # ============================================================
-# PUBLISH
+# ROUTE: STORAGE TEST
 # ============================================================
 
-@app.route("/publish", methods=["POST"])
+@app.get("/storage-test")
+def storage_test():
+
+    result = telegram(
+        "sendMessage",
+        payload={
+            "chat_id":
+                STORAGE_CHAT_ID,
+            "text":
+                "Kawaii Chan Storage test"
+        }
+    )
+
+    if not result.get("ok"):
+
+        return jsonify({
+            "ok": False,
+            "error":
+                result.get(
+                    "description",
+                    "Storage error"
+                )
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        "message":
+            "Storage-канал работает.",
+        "message_id":
+            result["result"]["message_id"],
+        "storage_chat_id":
+            STORAGE_CHAT_ID
+    })
+
+
+# ============================================================
+# ROUTE: WEBAPP
+# ============================================================
+
+@app.post("/webapp")
+def webapp():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    return jsonify({
+        "ok": True,
+        "received": data
+    })
+
+
+# ============================================================
+# ROUTE: PUBLISH
+# ============================================================
+
+@app.post("/publish")
 def publish():
 
-    saved_paths = []
+    text = (
+        request.form.get(
+            "text",
+            ""
+        ).strip()
+    )
 
-    try:
+    # Поддерживаем JSON для текстового поста.
+    if request.is_json:
 
-        if request.is_json:
+        data = request.get_json(
+            silent=True
+        ) or {}
 
-            data = (
-                request.get_json(
-                    silent=True
-                )
-                or {}
-            )
-
-            text = (
-                data.get("text", "")
-                or ""
-            ).strip()
-
-            message_ids = publish_stored_post(
-                text,
-                []
-            )
-
-            return jsonify({
-                "ok": True,
-                "message": (
-                    "Пост успешно опубликован."
-                ),
-                "message_ids": message_ids,
-                "media_count": 0
-            })
-
-        text = (
-            request.form.get(
+        text = str(
+            data.get(
                 "text",
                 ""
             )
-            or ""
         ).strip()
-
-        media_files = request.files.getlist(
-            "photos"
-        )
-
-        # Также принимаем поле media
-        if not media_files:
-            media_files = request.files.getlist(
-                "media"
-            )
-
-        saved_paths = save_uploaded_media(
-            media_files
-        )
-
-        media_items = (
-            save_media_files_to_storage(
-                saved_paths
-            )
-        )
-
-        message_ids = publish_stored_post(
-            text,
-            media_items
-        )
-
-        return jsonify({
-            "ok": True,
-            "message": (
-                "Пост успешно опубликован."
-            ),
-            "message_ids": message_ids,
-            "media_count": len(media_items)
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-    finally:
-
-        cleanup_files(
-            saved_paths
-        )
-
-
-# ============================================================
-# SCHEDULE
-# ============================================================
-
-@app.route("/schedule", methods=["POST"])
-def schedule():
-
-    saved_paths = []
 
     try:
 
         if request.is_json:
 
-            data = (
-                request.get_json(
-                    silent=True
-                )
-                or {}
-            )
-
-            text = (
-                data.get("text", "")
-                or ""
-            ).strip()
-
-            run_at = (
-                data.get("run_at", "")
-                or ""
-            ).strip()
-
-            media_items = (
-                data.get("media")
-                or []
-            )
+            media = []
 
         else:
 
-            text = (
-                request.form.get(
-                    "text",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            run_at = (
-                request.form.get(
-                    "run_at",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            media_files = request.files.getlist(
-                "photos"
+            media = (
+                upload_request_media_to_storage()
             )
 
-            if not media_files:
-                media_files = request.files.getlist(
-                    "media"
-                )
-
-            saved_paths = save_uploaded_media(
-                media_files
-            )
-
-            media_items = (
-                save_media_files_to_storage(
-                    saved_paths
-                )
-            )
-
-        if not text and not media_items:
+        if not text and not media:
 
             return jsonify({
                 "ok": False,
-                "error": "Пост пустой."
+                "error":
+                    "Нужен текст или хотя бы один файл."
             }), 400
 
-        validate_text(text)
-
-        parsed_time = parse_iso_datetime(
-            run_at
+        message_ids = publish_stored_media(
+            media,
+            text
         )
 
-        if not parsed_time:
+        save_post_history(
+            message_ids,
+            text,
+            media
+        )
+
+        return jsonify({
+            "ok": True,
+            "message_ids":
+                message_ids,
+            "media_count":
+                len(media),
+            "photo_count":
+                sum(
+                    1 for x in media
+                    if x["type"] == "photo"
+                ),
+            "video_count":
+                sum(
+                    1 for x in media
+                    if x["type"] == "video"
+                )
+        })
+
+    except Exception as exc:
+
+        return jsonify({
+            "ok": False,
+            "error": str(exc)
+        }), 500
+
+
+# ============================================================
+# ROUTE: SCHEDULE
+# ============================================================
+
+@app.post("/schedule")
+def schedule():
+
+    text = (
+        request.form.get(
+            "text",
+            ""
+        ).strip()
+    )
+
+    run_at = (
+        request.form.get(
+            "run_at",
+            ""
+        ).strip()
+    )
+
+    if not run_at:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Не указаны дата и время."
+        }), 400
+
+    try:
+
+        # Проверяем дату.
+        datetime.fromisoformat(
+            run_at.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+    except Exception:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Неверный формат даты."
+        }), 400
+
+    try:
+
+        media = (
+            upload_request_media_to_storage()
+        )
+
+        if not text and not media:
 
             return jsonify({
                 "ok": False,
-                "error": (
-                    "Неверная дата или время."
-                )
+                "error":
+                    "Нужен текст или хотя бы один файл."
             }), 400
-
-        if parsed_time <= now_utc():
-
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "Время публикации должно "
-                    "быть в будущем."
-                )
-            }), 400
-
-        created_at = now_iso()
 
         with db_lock:
 
-            db = get_db()
+            conn = get_db()
 
-            cursor = db.execute(
+            cursor = conn.execute(
                 """
-                INSERT INTO scheduled
+                INSERT INTO scheduled_posts
                 (
                     text,
                     run_at,
@@ -1052,643 +924,172 @@ def schedule():
                     status,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'pending', ?)
                 """,
                 (
                     text,
-                    parsed_time.isoformat(),
+                    run_at,
                     json.dumps(
-                        media_items,
+                        media,
                         ensure_ascii=False
                     ),
-                    "pending",
-                    created_at
+                    now_iso()
                 )
             )
 
-            scheduled_id = cursor.lastrowid
+            job_id = cursor.lastrowid
 
-            db.commit()
-            db.close()
-
-        return jsonify({
-            "ok": True,
-            "message": (
-                "Пост поставлен в очередь."
-            ),
-            "id": scheduled_id,
-            "run_at": parsed_time.isoformat(),
-            "media_count": len(media_items)
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-    finally:
-
-        cleanup_files(
-            saved_paths
-        )
-
-
-# ============================================================
-# SCHEDULED LIST
-# ============================================================
-
-@app.route("/scheduled", methods=["GET"])
-def scheduled_list():
-
-    try:
-
-        with db_lock:
-
-            db = get_db()
-
-            rows = db.execute(
-                """
-                SELECT *
-                FROM scheduled
-                ORDER BY run_at ASC
-                """
-            ).fetchall()
-
-            db.close()
-
-        result = []
-
-        for row in rows:
-
-            media = []
-
-            try:
-                media = json.loads(
-                    row["media_json"]
-                    or "[]"
-                )
-            except Exception:
-                media = []
-
-            photo_count = sum(
-                1
-                for item in media
-                if item.get("type") == "photo"
-            )
-
-            video_count = sum(
-                1
-                for item in media
-                if item.get("type") == "video"
-            )
-
-            result.append({
-                "id": row["id"],
-                "text": row["text"],
-                "run_at": row["run_at"],
-                "status": row["status"],
-                "error": row["error"],
-                "media_count": len(media),
-                "photo_count": photo_count,
-                "video_count": video_count,
-                "created_at": row["created_at"]
-            })
+            conn.commit()
+            conn.close()
 
         return jsonify({
             "ok": True,
-            "items": result
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# CANCEL SCHEDULED
-# ============================================================
-
-@app.route(
-    "/scheduled/<int:scheduled_id>",
-    methods=["DELETE"]
-)
-def cancel_scheduled(scheduled_id):
-
-    try:
-
-        with db_lock:
-
-            db = get_db()
-
-            row = db.execute(
-                """
-                SELECT *
-                FROM scheduled
-                WHERE id = ?
-                """,
-                (scheduled_id,)
-            ).fetchone()
-
-            if not row:
-
-                db.close()
-
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        "Отложенный пост "
-                        "не найден."
-                    )
-                }), 404
-
-            db.execute(
-                """
-                DELETE FROM scheduled
-                WHERE id = ?
-                """,
-                (scheduled_id,)
-            )
-
-            db.commit()
-            db.close()
-
-        return jsonify({
-            "ok": True,
-            "message": (
-                "Отложенный пост отменён."
-            )
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# POSTS HISTORY
-# ============================================================
-
-@app.route("/posts", methods=["GET"])
-def posts():
-
-    try:
-
-        with db_lock:
-
-            db = get_db()
-
-            rows = db.execute(
-                """
-                SELECT *
-                FROM posts
-                ORDER BY id DESC
-                LIMIT 100
-                """
-            ).fetchall()
-
-            db.close()
-
-        result = []
-
-        for row in rows:
-
-            try:
-                message_ids = json.loads(
-                    row["telegram_message_ids"]
-                )
-            except Exception:
-                message_ids = []
-
-            result.append({
-                "id": row["id"],
-                "text": row["text"],
-                "media_count": row["media_count"],
-                "photo_count": row["photo_count"],
-                "video_count": row["video_count"],
-                "post_type": row["post_type"],
-                "message_ids": message_ids,
-                "created_at": row["created_at"]
-            })
-
-        return jsonify({
-            "ok": True,
-            "items": result
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# GET POST
-# ============================================================
-
-@app.route(
-    "/posts/<int:post_id>",
-    methods=["GET"]
-)
-def get_post(post_id):
-
-    try:
-
-        with db_lock:
-
-            db = get_db()
-
-            row = db.execute(
-                """
-                SELECT *
-                FROM posts
-                WHERE id = ?
-                """,
-                (post_id,)
-            ).fetchone()
-
-            db.close()
-
-        if not row:
-
-            return jsonify({
-                "ok": False,
-                "error": "Пост не найден."
-            }), 404
-
-        return jsonify({
-            "ok": True,
-            "post": {
-                "id": row["id"],
-                "text": row["text"],
-                "media_count": row["media_count"],
-                "photo_count": row["photo_count"],
-                "video_count": row["video_count"],
-                "post_type": row["post_type"],
-                "message_ids": json.loads(
-                    row["telegram_message_ids"]
+            "id":
+                job_id,
+            "run_at":
+                run_at,
+            "media_count":
+                len(media),
+            "photo_count":
+                sum(
+                    1 for x in media
+                    if x["type"] == "photo"
                 ),
-                "created_at": row["created_at"]
-            }
+            "video_count":
+                sum(
+                    1 for x in media
+                    if x["type"] == "video"
+                )
         })
 
-    except Exception as error:
+    except Exception as exc:
 
         return jsonify({
             "ok": False,
-            "error": str(error)
+            "error": str(exc)
         }), 500
 
 
 # ============================================================
-# EDIT POST
+# ROUTE: SCHEDULED LIST
 # ============================================================
 
-@app.route(
-    "/posts/edit",
-    methods=["POST"]
-)
-def edit_post():
+@app.get("/scheduled")
+def scheduled():
 
-    try:
+    with db_lock:
 
-        data = (
-            request.get_json(
-                silent=True
-            )
-            or {}
+        conn = get_db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM scheduled_posts
+            ORDER BY run_at ASC
+            """
+        ).fetchall()
+
+        conn.close()
+
+    items = []
+
+    for row in rows:
+
+        media = safe_json(
+            row["media_json"],
+            []
         )
 
-        post_id = data.get("id")
-
-        new_text = (
-            data.get("text", "")
-            or ""
-        ).strip()
-
-        if not post_id:
-
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "Не указан ID поста."
-                )
-            }), 400
-
-        if not new_text:
-
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "Новый текст пустой."
-                )
-            }), 400
-
-        validate_text(new_text)
-
-        with db_lock:
-
-            db = get_db()
-
-            row = db.execute(
-                """
-                SELECT *
-                FROM posts
-                WHERE id = ?
-                """,
-                (post_id,)
-            ).fetchone()
-
-            if not row:
-
-                db.close()
-
-                return jsonify({
-                    "ok": False,
-                    "error": "Пост не найден."
-                }), 404
-
-            message_ids = json.loads(
-                row["telegram_message_ids"]
-            )
-
-            if not message_ids:
-
-                db.close()
-
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        "Telegram message ID "
-                        "не найден."
-                    )
-                }), 400
-
-            first_message_id = message_ids[0]
-
-            if row["media_count"] > 0:
-
-                telegram_api(
-                    "editMessageCaption",
-                    data={
-                        "chat_id": CHANNEL_USERNAME,
-                        "message_id": first_message_id,
-                        "caption": (
-                            new_text[
-                                :MAX_CAPTION_LENGTH
-                            ]
-                        )
-                    }
-                )
-
-            else:
-
-                telegram_api(
-                    "editMessageText",
-                    data={
-                        "chat_id": CHANNEL_USERNAME,
-                        "message_id": first_message_id,
-                        "text": new_text
-                    }
-                )
-
-            db.execute(
-                """
-                UPDATE posts
-                SET text = ?
-                WHERE id = ?
-                """,
-                (
-                    new_text,
-                    post_id
-                )
-            )
-
-            db.commit()
-            db.close()
-
-        return jsonify({
-            "ok": True,
-            "message": "Пост обновлён."
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# DELETE POST
-# ============================================================
-
-@app.route(
-    "/posts/<int:post_id>",
-    methods=["DELETE"]
-)
-def delete_post(post_id):
-
-    try:
-
-        with db_lock:
-
-            db = get_db()
-
-            row = db.execute(
-                """
-                SELECT *
-                FROM posts
-                WHERE id = ?
-                """,
-                (post_id,)
-            ).fetchone()
-
-            if not row:
-
-                db.close()
-
-                return jsonify({
-                    "ok": False,
-                    "error": "Пост не найден."
-                }), 404
-
-            message_ids = json.loads(
-                row["telegram_message_ids"]
-            )
-
-            errors = []
-
-            for message_id in message_ids:
-
-                try:
-
-                    telegram_api(
-                        "deleteMessage",
-                        data={
-                            "chat_id": CHANNEL_USERNAME,
-                            "message_id": message_id
-                        }
-                    )
-
-                except Exception as error:
-
-                    errors.append(
-                        str(error)
-                    )
-
-            db.execute(
-                """
-                DELETE FROM posts
-                WHERE id = ?
-                """,
-                (post_id,)
-            )
-
-            db.commit()
-            db.close()
-
-        if errors:
-
-            return jsonify({
-                "ok": True,
-                "message": (
-                    "Запись удалена, "
-                    "но Telegram не смог "
-                    "удалить одно или несколько "
-                    "сообщений."
+        items.append({
+            "id":
+                row["id"],
+            "text":
+                row["text"],
+            "run_at":
+                row["run_at"],
+            "status":
+                row["status"],
+            "created_at":
+                row["created_at"],
+            "published_at":
+                row["published_at"],
+            "error":
+                row["error"],
+            "media_count":
+                len(media),
+            "photo_count":
+                sum(
+                    1 for x in media
+                    if x.get("type") == "photo"
                 ),
-                "errors": errors
-            })
-
-        return jsonify({
-            "ok": True,
-            "message": "Пост удалён."
+            "video_count":
+                sum(
+                    1 for x in media
+                    if x.get("type") == "video"
+                )
         })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# STATISTICS
-# ============================================================
-
-@app.route("/stats", methods=["GET"])
-def stats():
-
-    try:
-
-        member_result = telegram_api(
-            "getChatMemberCount",
-            data={
-                "chat_id": CHANNEL_USERNAME
-            }
-        )
-
-        with db_lock:
-
-            db = get_db()
-
-            posts_count = db.execute(
-                """
-                SELECT COUNT(*)
-                FROM posts
-                """
-            ).fetchone()[0]
-
-            media_count = db.execute(
-                """
-                SELECT COALESCE(
-                    SUM(media_count),
-                    0
-                )
-                FROM posts
-                """
-            ).fetchone()[0]
-
-            photo_count = db.execute(
-                """
-                SELECT COALESCE(
-                    SUM(photo_count),
-                    0
-                )
-                FROM posts
-                """
-            ).fetchone()[0]
-
-            video_count = db.execute(
-                """
-                SELECT COALESCE(
-                    SUM(video_count),
-                    0
-                )
-                FROM posts
-                """
-            ).fetchone()[0]
-
-            scheduled_count = db.execute(
-                """
-                SELECT COUNT(*)
-                FROM scheduled
-                WHERE status = 'pending'
-                """
-            ).fetchone()[0]
-
-            db.close()
-
-        return jsonify({
-            "ok": True,
-            "channel": CHANNEL_USERNAME,
-            "members": member_result,
-            "posts_published_by_app": posts_count,
-            "media_published_by_app": media_count,
-            "photos_published_by_app": photo_count,
-            "videos_published_by_app": video_count,
-            "scheduled_pending": scheduled_count
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "ok": False,
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-@app.route("/settings", methods=["GET"])
-def settings():
 
     return jsonify({
         "ok": True,
-        "channel": CHANNEL_USERNAME,
-        "storage_chat_id": STORAGE_CHAT_ID,
-        "backend": "online",
-        "scheduler": "active",
-        "max_media_per_publication": MAX_MEDIA,
-        "max_media_per_album": MAX_MEDIA_PER_ALBUM,
-        "max_text_length": MAX_TEXT_LENGTH,
-        "max_caption_length": MAX_CAPTION_LENGTH,
-        "max_video_size_mb": 50,
-        "server_time_utc": now_iso()
+        "items":
+            items
+    })
+
+
+# ============================================================
+# ROUTE: CANCEL SCHEDULED
+# ============================================================
+
+@app.delete("/scheduled/<int:post_id>")
+def cancel_scheduled(post_id):
+
+    with db_lock:
+
+        conn = get_db()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM scheduled_posts
+            WHERE id = ?
+            """,
+            (post_id,)
+        ).fetchone()
+
+        if not row:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Пост не найден."
+            }), 404
+
+        if row["status"] != "pending":
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Этот пост уже обработан."
+            }), 400
+
+        conn.execute(
+            """
+            UPDATE scheduled_posts
+            SET status = 'cancelled'
+            WHERE id = ?
+            """,
+            (post_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+    return jsonify({
+        "ok": True
     })
 
 
@@ -1696,194 +1097,535 @@ def settings():
 # SCHEDULER
 # ============================================================
 
-def process_scheduled_posts_once():
+def process_due_posts():
 
-    current_time = now_utc()
+    current = datetime.now(
+        timezone.utc
+    )
 
     with db_lock:
 
-        db = get_db()
+        conn = get_db()
 
-        rows = db.execute(
+        rows = conn.execute(
             """
             SELECT *
-            FROM scheduled
+            FROM scheduled_posts
             WHERE status = 'pending'
             ORDER BY run_at ASC
             """
         ).fetchall()
 
-        db.close()
-
-    processed = 0
+        conn.close()
 
     for row in rows:
 
-        run_at = parse_iso_datetime(
-            row["run_at"]
-        )
-
-        if not run_at:
-            continue
-
-        if run_at > current_time:
-            continue
-
-        scheduled_id = row["id"]
-
-        # Захватываем задачу
-        with db_lock:
-
-            db = get_db()
-
-            cursor = db.execute(
-                """
-                UPDATE scheduled
-                SET status = 'processing'
-                WHERE id = ?
-                AND status = 'pending'
-                """,
-                (scheduled_id,)
-            )
-
-            db.commit()
-
-            claimed = (
-                cursor.rowcount == 1
-            )
-
-            db.close()
-
-        if not claimed:
-            continue
-
         try:
 
-            media_items = []
-
-            try:
-                media_items = json.loads(
-                    row["media_json"]
-                    or "[]"
+            run_at = datetime.fromisoformat(
+                row["run_at"].replace(
+                    "Z",
+                    "+00:00"
                 )
-            except Exception:
-                media_items = []
+            )
 
-            publish_stored_post(
+            if run_at.tzinfo is None:
+
+                run_at = run_at.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if run_at > current:
+
+                continue
+
+            media = safe_json(
+                row["media_json"],
+                []
+            )
+
+            message_ids = publish_stored_media(
+                media,
+                row["text"] or ""
+            )
+
+            save_post_history(
+                message_ids,
                 row["text"] or "",
-                media_items
+                media
             )
 
             with db_lock:
 
-                db = get_db()
+                conn = get_db()
 
-                db.execute(
+                conn.execute(
                     """
-                    UPDATE scheduled
-                    SET status = 'done'
+                    UPDATE scheduled_posts
+                    SET
+                        status = 'published',
+                        published_at = ?,
+                        error = NULL
                     WHERE id = ?
                     """,
-                    (scheduled_id,)
+                    (
+                        now_iso(),
+                        row["id"]
+                    )
                 )
 
-                db.commit()
-                db.close()
+                conn.commit()
+                conn.close()
 
-            processed += 1
-
-        except Exception as error:
+        except Exception as exc:
 
             with db_lock:
 
-                db = get_db()
+                conn = get_db()
 
-                db.execute(
+                conn.execute(
                     """
-                    UPDATE scheduled
-                    SET status = 'error',
+                    UPDATE scheduled_posts
+                    SET
+                        status = 'error',
                         error = ?
                     WHERE id = ?
                     """,
                     (
-                        str(error),
-                        scheduled_id
+                        str(exc),
+                        row["id"]
                     )
                 )
 
-                db.commit()
-                db.close()
-
-    return processed
+                conn.commit()
+                conn.close()
 
 
-def process_scheduled_posts():
+@app.get("/scheduler/tick")
+def scheduler_tick():
+
+    process_due_posts()
+
+    return jsonify({
+        "ok": True,
+        "time":
+            now_iso()
+    })
+
+
+def scheduler_loop():
 
     while True:
 
         try:
 
-            process_scheduled_posts_once()
+            process_due_posts()
 
         except Exception:
-            # Не позволяем потоку умереть
+
             pass
 
-        time.sleep(
-            SCHEDULER_INTERVAL
-        )
+        time.sleep(20)
 
 
 # ============================================================
-# EXTERNAL SCHEDULER ENDPOINT
+# POSTS HISTORY
 # ============================================================
 
-@app.route(
-    "/scheduler/tick",
-    methods=["GET", "POST"]
-)
-def scheduler_tick():
+@app.get("/posts")
+def posts():
 
-    try:
+    with db_lock:
 
-        processed = (
-            process_scheduled_posts_once()
+        conn = get_db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM posts
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        conn.close()
+
+    items = []
+
+    for row in rows:
+
+        media = safe_json(
+            row["media_json"],
+            []
         )
 
-        return jsonify({
-            "ok": True,
-            "processed": processed,
-            "time": now_iso()
+        items.append({
+            "id":
+                row["id"],
+            "text":
+                row["text"],
+            "post_type":
+                row["post_type"],
+            "created_at":
+                row["created_at"],
+            "telegram_message_ids":
+                safe_json(
+                    row["telegram_message_ids"],
+                    []
+                ),
+            "media_count":
+                len(media),
+            "photo_count":
+                sum(
+                    1 for x in media
+                    if x.get("type") == "photo"
+                ),
+            "video_count":
+                sum(
+                    1 for x in media
+                    if x.get("type") == "video"
+                )
         })
 
-    except Exception as error:
+    return jsonify({
+        "ok": True,
+        "items":
+            items
+    })
+
+
+# ============================================================
+# EDIT POST
+# ============================================================
+
+@app.post("/posts/edit")
+def edit_post():
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    post_id = data.get(
+        "id"
+    )
+
+    new_text = str(
+        data.get(
+            "text",
+            ""
+        )
+    ).strip()
+
+    if not post_id:
 
         return jsonify({
             "ok": False,
-            "error": str(error)
+            "error":
+                "Не указан ID поста."
+        }), 400
+
+    with db_lock:
+
+        conn = get_db()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM posts
+            WHERE id = ?
+            """,
+            (post_id,)
+        ).fetchone()
+
+        if not row:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Пост не найден."
+            }), 404
+
+        message_ids = safe_json(
+            row["telegram_message_ids"],
+            []
+        )
+
+        if not message_ids:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "У поста нет Telegram message_id."
+            }), 400
+
+        # Если это обычный текстовый пост,
+        # редактируем первое сообщение.
+        if row["post_type"] == "text":
+
+            result = telegram(
+                "editMessageText",
+                payload={
+                    "chat_id":
+                        CHANNEL_USERNAME,
+                    "message_id":
+                        message_ids[0],
+                    "text":
+                        new_text,
+                    "parse_mode":
+                        "HTML"
+                }
+            )
+
+        else:
+
+            # Для медиа редактируем подпись
+            # первого сообщения альбома.
+            result = telegram(
+                "editMessageCaption",
+                payload={
+                    "chat_id":
+                        CHANNEL_USERNAME,
+                    "message_id":
+                        message_ids[0],
+                    "caption":
+                        new_text,
+                    "parse_mode":
+                        "HTML"
+                }
+            )
+
+        if not result.get("ok"):
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    result.get(
+                        "description",
+                        "Telegram не смог изменить пост."
+                    )
+            }), 500
+
+        conn.execute(
+            """
+            UPDATE posts
+            SET text = ?
+            WHERE id = ?
+            """,
+            (
+                new_text,
+                post_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    return jsonify({
+        "ok": True
+    })
+
+
+# ============================================================
+# DELETE POST
+# ============================================================
+
+@app.delete("/posts/<int:post_id>")
+def delete_post(post_id):
+
+    with db_lock:
+
+        conn = get_db()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM posts
+            WHERE id = ?
+            """,
+            (post_id,)
+        ).fetchone()
+
+        if not row:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Пост не найден."
+            }), 404
+
+        message_ids = safe_json(
+            row["telegram_message_ids"],
+            []
+        )
+
+        errors = []
+
+        for message_id in message_ids:
+
+            result = telegram(
+                "deleteMessage",
+                payload={
+                    "chat_id":
+                        CHANNEL_USERNAME,
+                    "message_id":
+                        message_id
+                }
+            )
+
+            if not result.get("ok"):
+
+                errors.append(
+                    result.get(
+                        "description",
+                        "Ошибка удаления"
+                    )
+                )
+
+        conn.execute(
+            """
+            DELETE FROM posts
+            WHERE id = ?
+            """,
+            (post_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+    if errors:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "; ".join(errors)
         }), 500
 
-
-# ============================================================
-# START SCHEDULER
-# ============================================================
-
-scheduler_thread = threading.Thread(
-    target=process_scheduled_posts,
-    daemon=True
-)
-
-scheduler_thread.start()
+    return jsonify({
+        "ok": True
+    })
 
 
 # ============================================================
-# RUN
+# STATS
 # ============================================================
+
+@app.get("/stats")
+def stats():
+
+    with db_lock:
+
+        conn = get_db()
+
+        total_posts = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM posts
+            """
+        ).fetchone()[0]
+
+        scheduled_total = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM scheduled_posts
+            """
+        ).fetchone()[0]
+
+        scheduled_pending = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM scheduled_posts
+            WHERE status = 'pending'
+            """
+        ).fetchone()[0]
+
+        scheduled_published = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM scheduled_posts
+            WHERE status = 'published'
+            """
+        ).fetchone()[0]
+
+        scheduled_errors = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM scheduled_posts
+            WHERE status = 'error'
+            """
+        ).fetchone()[0]
+
+        conn.close()
+
+    return jsonify({
+        "ok": True,
+        "stats": {
+            "published_posts":
+                total_posts,
+            "scheduled_total":
+                scheduled_total,
+            "scheduled_pending":
+                scheduled_pending,
+            "scheduled_published":
+                scheduled_published,
+            "scheduled_errors":
+                scheduled_errors
+        }
+    })
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+@app.get("/settings")
+def settings():
+
+    return jsonify({
+        "ok": True,
+        "channel":
+            CHANNEL_USERNAME,
+        "storage_chat_id":
+            STORAGE_CHAT_ID,
+        "max_media":
+            MAX_MEDIA,
+        "max_video_size_mb":
+            50
+    })
+
+
+# ============================================================
+# START
+# ============================================================
+
+def start_scheduler():
+
+    thread = threading.Thread(
+        target=scheduler_loop,
+        daemon=True
+    )
+
+    thread.start()
+
+
+start_scheduler()
+
 
 if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=PORT,
-        debug=False
+        port=int(
+            os.environ.get(
+                "PORT",
+                "10000"
+            )
+        )
     )
