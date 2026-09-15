@@ -2424,8 +2424,7 @@ def publish_album(album_id):
     # -----------------------------------------------------
     # Отправляем первую страницу
     # -----------------------------------------------------
-
-        publish_method = (
+    publish_method = (
         "sendPhoto"
         if first_item["type"] == "photo"
         else "sendVideo"
@@ -2469,7 +2468,8 @@ def publish_album(album_id):
     result = telegram(
         publish_method,
         payload=publish_payload
-)
+    )
+        
 
     if not result.get("ok"):
 
