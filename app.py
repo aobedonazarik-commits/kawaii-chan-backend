@@ -2425,38 +2425,51 @@ def publish_album(album_id):
     # Отправляем первую страницу
     # -----------------------------------------------------
 
-    result = telegram(
-        "sendPhoto"
-        if first_item["type"] == "photo"
-        else "sendVideo",
+    publish_method = (
+    "sendPhoto"
+    if first_item["type"] == "photo"
+    else "sendVideo"
+)
 
-        payload={
-            "chat_id":
-                CHANNEL_USERNAME,
+publish_payload = {
+    "chat_id":
+        CHANNEL_USERNAME,
 
-            "caption":
-                caption,
+    "caption":
+        caption,
 
-            "parse_mode":
-                "HTML",
+    "parse_mode":
+        "HTML",
 
-            "disable_notification":
-                "false",
+    "disable_notification":
+        "false",
 
-            "reply_markup":
-                json.dumps({
-                    "inline_keyboard": [[
-                        {
-                            "text":
-                                "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
+    "reply_markup":
+        json.dumps({
+            "inline_keyboard": [[
+                {
+                    "text":
+                        "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
+                    "url":
+                        album_url
+                }
+            ]]
+        }, ensure_ascii=False)
+}
 
-                            "url":
-                                album_url
-                        }
-                    ]]
-                }, ensure_ascii=False)
-        }
+if first_item["type"] == "photo":
+    publish_payload["photo"] = (
+        first_item["file_id"]
     )
+else:
+    publish_payload["video"] = (
+        first_item["file_id"]
+    )
+
+result = telegram(
+    publish_method,
+    payload=publish_payload
+)
 
     if not result.get("ok"):
 
