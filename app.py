@@ -7,13 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
@@ -44,28 +44,36 @@ UPLOAD_DIR.mkdir(
     exist_ok=True
 )
 
+# URL твоего Mini App.
+# Пока оставляем GitHub Pages.
+MINI_APP_URL = os.environ.get(
+    "MINI_APP_URL",
+    "https://aobedonazarik-commits.github.io/kawaii-chan-mini-app/"
+).strip()
+
 MAX_MEDIA = 100
+
+# Пока обычный Telegram Bot API.
 MAX_VIDEO_SIZE = 50 * 1024 * 1024
+
+# Максимум страниц в одном альбоме.
+MAX_ALBUM_ITEMS = 200
+
 
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{BOT_TOKEN}"
 )
 
 
-# ============================================================
-# APP
-# ============================================================
-
 app = Flask(__name__)
 CORS(app)
 
-
-# ============================================================
-# DATABASE
-# ============================================================
-
 db_lock = threading.Lock()
 
+
+# =========================================================
+# DATABASE
+# =========================================================
 
 def get_db():
     conn = sqlite3.connect(
@@ -73,9 +81,7 @@ def get_db():
         timeout=30,
         check_same_thread=False
     )
-
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
@@ -84,6 +90,25 @@ def init_db():
     with db_lock:
 
         conn = get_db()
+
+        # -------------------------------------------------
+        # Обычные посты
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_message_ids TEXT DEFAULT '[]',
+                text TEXT DEFAULT '',
+                media_json TEXT DEFAULT '[]',
+                post_type TEXT DEFAULT 'text',
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # -------------------------------------------------
+        # Отложенные посты
+        # -------------------------------------------------
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_posts (
@@ -98,15 +123,45 @@ def init_db():
             )
         """)
 
+        # -------------------------------------------------
+        # НОВОЕ: альбомы
+        # -------------------------------------------------
+
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
+            CREATE TABLE IF NOT EXISTS albums (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_message_ids TEXT DEFAULT '[]',
-                text TEXT DEFAULT '',
-                media_json TEXT DEFAULT '[]',
-                post_type TEXT DEFAULT 'text',
-                created_at TEXT NOT NULL
+                title TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                published_message_id INTEGER,
+                status TEXT DEFAULT 'draft'
             )
+        """)
+
+        # -------------------------------------------------
+        # НОВОЕ: страницы альбомов
+        # -------------------------------------------------
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS album_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                album_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                storage_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(album_id)
+                    REFERENCES albums(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_album_items_album_position
+            ON album_items(album_id, position)
         """)
 
         conn.commit()
@@ -116,28 +171,29 @@ def init_db():
 init_db()
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+# =========================================================
+# ВРЕМЯ
+# =========================================================
 
 def now_iso():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
+
+# =========================================================
+# TELEGRAM API
+# =========================================================
 
 def telegram(method, payload=None, files=None):
 
     if not BOT_TOKEN:
-
         return {
             "ok": False,
             "error": "BOT_TOKEN не настроен."
         }
 
     url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/{method}"
+        f"https://api.telegram.org/bot"
+        f"{BOT_TOKEN}/{method}"
     )
 
     try:
@@ -153,7 +209,6 @@ def telegram(method, payload=None, files=None):
             return response.json()
 
         except Exception:
-
             return {
                 "ok": False,
                 "error":
@@ -170,21 +225,26 @@ def telegram(method, payload=None, files=None):
         }
 
 
+# =========================================================
+# JSON
+# =========================================================
+
 def safe_json(value, default):
 
     try:
-
         return json.loads(value)
 
     except Exception:
-
         return default
 
+
+# =========================================================
+# ВРЕМЕННЫЕ ФАЙЛЫ
+# =========================================================
 
 def save_temp_file(file):
 
     if not file or not file.filename:
-
         return None
 
     filename = os.path.basename(
@@ -210,19 +270,17 @@ def cleanup_files(paths):
     for path in paths:
 
         try:
-
             Path(path).unlink(
                 missing_ok=True
             )
 
         except Exception:
-
             pass
 
 
-# ============================================================
-# TELEGRAM STORAGE
-# ============================================================
+# =========================================================
+# STORAGE — ФОТО
+# =========================================================
 
 def save_photo_to_storage(path):
 
@@ -262,7 +320,8 @@ def save_photo_to_storage(path):
     if not photos:
 
         raise RuntimeError(
-            "Telegram не вернул file_id фотографии."
+            "Telegram не вернул "
+            "file_id фотографии."
         )
 
     file_id = photos[-1]["file_id"]
@@ -274,6 +333,10 @@ def save_photo_to_storage(path):
             message.get("message_id")
     }
 
+
+# =========================================================
+# STORAGE — ВИДЕО
+# =========================================================
 
 def save_video_to_storage(path):
 
@@ -321,7 +384,8 @@ def save_video_to_storage(path):
     if not video_data:
 
         raise RuntimeError(
-            "Telegram не вернул file_id видео."
+            "Telegram не вернул "
+            "file_id видео."
         )
 
     return {
@@ -333,47 +397,38 @@ def save_video_to_storage(path):
     }
 
 
+# =========================================================
+# STORAGE — ОБЩАЯ ФУНКЦИЯ
+# =========================================================
+
 def save_media_to_storage(
     path,
     media_type
 ):
 
     if media_type == "video":
+        return save_video_to_storage(path)
 
-        return save_video_to_storage(
-            path
-        )
-
-    return save_photo_to_storage(
-        path
-    )
+    return save_photo_to_storage(path)
 
 
-# ============================================================
-# REQUEST MEDIA
-# ============================================================
+# =========================================================
+# ПОЛУЧЕНИЕ ЗАГРУЖЕННЫХ ФАЙЛОВ
+# =========================================================
 
 def get_uploaded_media():
 
     files = []
 
-    # Новый интерфейс отправляет "photos".
     files.extend(
-        request.files.getlist(
-            "photos"
-        )
+        request.files.getlist("photos")
     )
 
-    # Также поддерживаем "media".
     files.extend(
-        request.files.getlist(
-            "media"
-        )
+        request.files.getlist("media")
     )
 
-    # Убираем дубликаты объектов.
     unique = []
-
     seen = set()
 
     for item in files:
@@ -387,6 +442,10 @@ def get_uploaded_media():
 
     return unique
 
+
+# =========================================================
+# ЗАГРУЗКА МЕДИА В STORAGE
+# =========================================================
 
 def upload_request_media_to_storage():
 
@@ -425,16 +484,13 @@ def upload_request_media_to_storage():
             else:
 
                 raise RuntimeError(
-                    f"Неподдерживаемый тип файла: "
+                    "Неподдерживаемый тип файла: "
                     f"{content_type or 'неизвестный'}"
                 )
 
-            path = save_temp_file(
-                file
-            )
+            path = save_temp_file(file)
 
             if not path:
-
                 continue
 
             temp_paths.append(path)
@@ -457,9 +513,9 @@ def upload_request_media_to_storage():
         )
 
 
-# ============================================================
-# PUBLISH MEDIA
-# ============================================================
+# =========================================================
+# ПУБЛИКАЦИЯ MEDIA GROUP
+# =========================================================
 
 def publish_media_group(
     media,
@@ -513,6 +569,7 @@ def publish_media_group(
         payload={
             "chat_id":
                 CHANNEL_USERNAME,
+
             "media":
                 json.dumps(
                     telegram_media,
@@ -521,6 +578,10 @@ def publish_media_group(
         }
     )
 
+
+# =========================================================
+# ПУБЛИКАЦИЯ СОХРАНЕННОГО МЕДИА
+# =========================================================
 
 def publish_stored_media(
     media,
@@ -534,8 +595,10 @@ def publish_stored_media(
             payload={
                 "chat_id":
                     CHANNEL_USERNAME,
+
                 "text":
                     text,
+
                 "parse_mode":
                     "HTML"
             }
@@ -556,7 +619,6 @@ def publish_stored_media(
 
     message_ids = []
 
-    # Telegram sendMediaGroup максимум 10.
     groups = [
         media[i:i + 10]
         for i in range(
@@ -566,7 +628,9 @@ def publish_stored_media(
         )
     ]
 
-    for group_index, group in enumerate(groups):
+    for group_index, group in enumerate(
+        groups
+    ):
 
         caption = (
             text
@@ -584,7 +648,8 @@ def publish_stored_media(
             raise RuntimeError(
                 result.get(
                     "description",
-                    "Не удалось опубликовать медиа."
+                    "Не удалось "
+                    "опубликовать медиа."
                 )
             )
 
@@ -594,7 +659,6 @@ def publish_stored_media(
                 message["message_id"]
             )
 
-        # Маленькая пауза между альбомами.
         if group_index < len(groups) - 1:
 
             time.sleep(0.5)
@@ -602,9 +666,9 @@ def publish_stored_media(
     return message_ids
 
 
-# ============================================================
-# HISTORY
-# ============================================================
+# =========================================================
+# ИСТОРИЯ ПОСТОВ
+# =========================================================
 
 def save_post_history(
     message_ids,
@@ -612,13 +676,11 @@ def save_post_history(
     media
 ):
 
-    if media:
-
-        post_type = "media"
-
-    else:
-
-        post_type = "text"
+    post_type = (
+        "media"
+        if media
+        else "text"
+    )
 
     with db_lock:
 
@@ -640,12 +702,16 @@ def save_post_history(
                 json.dumps(
                     message_ids
                 ),
+
                 text,
+
                 json.dumps(
                     media,
                     ensure_ascii=False
                 ),
+
                 post_type,
+
                 now_iso()
             )
         )
@@ -654,9 +720,9 @@ def save_post_history(
         conn.close()
 
 
-# ============================================================
-# ROUTE: HOME
-# ============================================================
+# =========================================================
+# ГЛАВНАЯ
+# =========================================================
 
 @app.get("/")
 def home():
@@ -671,14 +737,16 @@ def home():
             CHANNEL_USERNAME,
         "storage_chat_id":
             STORAGE_CHAT_ID,
+        "mini_app_url":
+            MINI_APP_URL,
         "time":
             now_iso()
     })
 
 
-# ============================================================
-# ROUTE: TEST
-# ============================================================
+# =========================================================
+# TEST BOT
+# =========================================================
 
 @app.get("/test")
 def test():
@@ -700,7 +768,8 @@ def test():
 
     return jsonify({
         "ok": True,
-        "bot": result["result"],
+        "bot":
+            result["result"],
         "channel":
             CHANNEL_USERNAME,
         "storage_chat_id":
@@ -708,9 +777,9 @@ def test():
     })
 
 
-# ============================================================
-# ROUTE: STORAGE TEST
-# ============================================================
+# =========================================================
+# STORAGE TEST
+# =========================================================
 
 @app.get("/storage-test")
 def storage_test():
@@ -720,6 +789,7 @@ def storage_test():
         payload={
             "chat_id":
                 STORAGE_CHAT_ID,
+
             "text":
                 "Kawaii Chan Storage test"
         }
@@ -747,16 +817,19 @@ def storage_test():
     })
 
 
-# ============================================================
-# ROUTE: WEBAPP
-# ============================================================
+# =========================================================
+# WEBAPP TEST
+# =========================================================
 
 @app.post("/webapp")
 def webapp():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     return jsonify({
         "ok": True,
@@ -764,26 +837,26 @@ def webapp():
     })
 
 
-# ============================================================
-# ROUTE: PUBLISH
-# ============================================================
+# =========================================================
+# ОБЫЧНАЯ ПУБЛИКАЦИЯ
+# =========================================================
 
 @app.post("/publish")
 def publish():
 
-    text = (
-        request.form.get(
-            "text",
-            ""
-        ).strip()
-    )
+    text = request.form.get(
+        "text",
+        ""
+    ).strip()
 
-    # Поддерживаем JSON для текстового поста.
     if request.is_json:
 
-        data = request.get_json(
-            silent=True
-        ) or {}
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
+        )
 
         text = str(
             data.get(
@@ -809,12 +882,15 @@ def publish():
             return jsonify({
                 "ok": False,
                 "error":
-                    "Нужен текст или хотя бы один файл."
+                    "Нужен текст "
+                    "или хотя бы один файл."
             }), 400
 
-        message_ids = publish_stored_media(
-            media,
-            text
+        message_ids = (
+            publish_stored_media(
+                media,
+                text
+            )
         )
 
         save_post_history(
@@ -831,12 +907,14 @@ def publish():
                 len(media),
             "photo_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x["type"] == "photo"
                 ),
             "video_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x["type"] == "video"
                 )
         })
@@ -845,30 +923,27 @@ def publish():
 
         return jsonify({
             "ok": False,
-            "error": str(exc)
+            "error":
+                str(exc)
         }), 500
 
 
-# ============================================================
-# ROUTE: SCHEDULE
-# ============================================================
+# =========================================================
+# ОТЛОЖЕННЫЙ ПОСТ
+# =========================================================
 
 @app.post("/schedule")
 def schedule():
 
-    text = (
-        request.form.get(
-            "text",
-            ""
-        ).strip()
-    )
+    text = request.form.get(
+        "text",
+        ""
+    ).strip()
 
-    run_at = (
-        request.form.get(
-            "run_at",
-            ""
-        ).strip()
-    )
+    run_at = request.form.get(
+        "run_at",
+        ""
+    ).strip()
 
     if not run_at:
 
@@ -880,7 +955,6 @@ def schedule():
 
     try:
 
-        # Проверяем дату.
         datetime.fromisoformat(
             run_at.replace(
                 "Z",
@@ -907,7 +981,8 @@ def schedule():
             return jsonify({
                 "ok": False,
                 "error":
-                    "Нужен текст или хотя бы один файл."
+                              "Нужен текст "
+                    "или хотя бы один файл."
             }), 400
 
         with db_lock:
@@ -928,11 +1003,14 @@ def schedule():
                 """,
                 (
                     text,
+
                     run_at,
+
                     json.dumps(
                         media,
                         ensure_ascii=False
                     ),
+
                     now_iso()
                 )
             )
@@ -952,12 +1030,14 @@ def schedule():
                 len(media),
             "photo_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x["type"] == "photo"
                 ),
             "video_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x["type"] == "video"
                 )
         })
@@ -966,13 +1046,14 @@ def schedule():
 
         return jsonify({
             "ok": False,
-            "error": str(exc)
+            "error":
+                str(exc)
         }), 500
 
 
-# ============================================================
-# ROUTE: SCHEDULED LIST
-# ============================================================
+# =========================================================
+# СПИСОК ОТЛОЖЕННЫХ
+# =========================================================
 
 @app.get("/scheduled")
 def scheduled():
@@ -1001,46 +1082,58 @@ def scheduled():
         )
 
         items.append({
+
             "id":
                 row["id"],
+
             "text":
                 row["text"],
+
             "run_at":
                 row["run_at"],
+
             "status":
                 row["status"],
+
             "created_at":
                 row["created_at"],
+
             "published_at":
                 row["published_at"],
+
             "error":
                 row["error"],
+
             "media_count":
                 len(media),
+
             "photo_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x.get("type") == "photo"
                 ),
+
             "video_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x.get("type") == "video"
                 )
         })
 
     return jsonify({
         "ok": True,
-        "items":
-            items
+        "items": items
     })
 
+# =========================================================
+# ОТМЕНА ОТЛОЖЕННОГО
+# =========================================================
 
-# ============================================================
-# ROUTE: CANCEL SCHEDULED
-# ============================================================
-
-@app.delete("/scheduled/<int:post_id>")
+@app.delete(
+    "/scheduled/<int:post_id>"
+)
 def cancel_scheduled(post_id):
 
     with db_lock:
@@ -1093,14 +1186,16 @@ def cancel_scheduled(post_id):
     })
 
 
-# ============================================================
-# SCHEDULER
-# ============================================================
+# =========================================================
+# ПЛАНИРОВЩИК
+# =========================================================
 
 def process_due_posts():
 
-    current = datetime.now(
-        timezone.utc
+    current = (
+        datetime.now(
+            timezone.utc
+        )
     )
 
     with db_lock:
@@ -1136,7 +1231,6 @@ def process_due_posts():
                 )
 
             if run_at > current:
-
                 continue
 
             media = safe_json(
@@ -1144,9 +1238,11 @@ def process_due_posts():
                 []
             )
 
-            message_ids = publish_stored_media(
-                media,
-                row["text"] or ""
+            message_ids = (
+                publish_stored_media(
+                    media,
+                    row["text"] or ""
+                )
             )
 
             save_post_history(
@@ -1201,7 +1297,9 @@ def process_due_posts():
                 conn.close()
 
 
-@app.get("/scheduler/tick")
+@app.get(
+    "/scheduler/tick"
+)
 def scheduler_tick():
 
     process_due_posts()
@@ -1218,19 +1316,17 @@ def scheduler_loop():
     while True:
 
         try:
-
             process_due_posts()
 
         except Exception:
-
             pass
 
         time.sleep(20)
 
 
-# ============================================================
-# POSTS HISTORY
-# ============================================================
+# =========================================================
+# ИСТОРИЯ ПОСТОВ
+# =========================================================
 
 @app.get("/posts")
 def posts():
@@ -1260,50 +1356,62 @@ def posts():
         )
 
         items.append({
+
             "id":
                 row["id"],
+
             "text":
                 row["text"],
+
             "post_type":
                 row["post_type"],
+
             "created_at":
                 row["created_at"],
+
             "telegram_message_ids":
                 safe_json(
-                    row["telegram_message_ids"],
+                    row[
+                        "telegram_message_ids"
+                    ],
                     []
                 ),
+
             "media_count":
                 len(media),
+
             "photo_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x.get("type") == "photo"
                 ),
+
             "video_count":
                 sum(
-                    1 for x in media
+                    1
+                    for x in media
                     if x.get("type") == "video"
                 )
         })
 
     return jsonify({
         "ok": True,
-        "items":
-            items
+        "items": items
     })
-
-
-# ============================================================
-# EDIT POST
-# ============================================================
+# =========================================================
+# РЕДАКТИРОВАНИЕ ПОСТА
+# =========================================================
 
 @app.post("/posts/edit")
 def edit_post():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     post_id = data.get(
         "id"
@@ -1362,8 +1470,6 @@ def edit_post():
                     "У поста нет Telegram message_id."
             }), 400
 
-        # Если это обычный текстовый пост,
-        # редактируем первое сообщение.
         if row["post_type"] == "text":
 
             result = telegram(
@@ -1371,10 +1477,13 @@ def edit_post():
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
+
                     "message_id":
                         message_ids[0],
+
                     "text":
                         new_text,
+
                     "parse_mode":
                         "HTML"
                 }
@@ -1382,17 +1491,18 @@ def edit_post():
 
         else:
 
-            # Для медиа редактируем подпись
-            # первого сообщения альбома.
             result = telegram(
                 "editMessageCaption",
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
+
                     "message_id":
                         message_ids[0],
+
                     "caption":
                         new_text,
+
                     "parse_mode":
                         "HTML"
                 }
@@ -1407,7 +1517,8 @@ def edit_post():
                 "error":
                     result.get(
                         "description",
-                        "Telegram не смог изменить пост."
+                        "Telegram не смог "
+                        "изменить пост."
                     )
             }), 500
 
@@ -1430,12 +1541,13 @@ def edit_post():
         "ok": True
     })
 
+# =========================================================
+# УДАЛЕНИЕ ПОСТА
+# =========================================================
 
-# ============================================================
-# DELETE POST
-# ============================================================
-
-@app.delete("/posts/<int:post_id>")
+@app.delete(
+    "/posts/<int:post_id>"
+)
 def delete_post(post_id):
 
     with db_lock:
@@ -1475,6 +1587,7 @@ def delete_post(post_id):
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
+
                     "message_id":
                         message_id
                 }
@@ -1511,11 +1624,9 @@ def delete_post(post_id):
     return jsonify({
         "ok": True
     })
-
-
-# ============================================================
-# STATS
-# ============================================================
+# =========================================================
+# СТАТИСТИКА
+# =========================================================
 
 @app.get("/stats")
 def stats():
@@ -1525,10 +1636,7 @@ def stats():
         conn = get_db()
 
         total_posts = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM posts
-            """
+            "SELECT COUNT(*) FROM posts"
         ).fetchone()[0]
 
         scheduled_total = conn.execute(
@@ -1562,48 +1670,848 @@ def stats():
             """
         ).fetchone()[0]
 
+        total_albums = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM albums
+            """
+        ).fetchone()[0]
+
         conn.close()
 
     return jsonify({
+
         "ok": True,
+
         "stats": {
+
             "published_posts":
                 total_posts,
+
             "scheduled_total":
                 scheduled_total,
+
             "scheduled_pending":
                 scheduled_pending,
+
             "scheduled_published":
                 scheduled_published,
+
             "scheduled_errors":
-                scheduled_errors
+                scheduled_errors,
+
+            "albums":
+                total_albums
         }
     })
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
 
 @app.get("/settings")
 def settings():
 
     return jsonify({
+
         "ok": True,
+
         "channel":
             CHANNEL_USERNAME,
+
         "storage_chat_id":
             STORAGE_CHAT_ID,
+
         "max_media":
             MAX_MEDIA,
+
         "max_video_size_mb":
-            50
+            50,
+
+        "max_album_items":
+            MAX_ALBUM_ITEMS,
+
+        "mini_app_url":
+            MINI_APP_URL
     })
 
 
-# ============================================================
-# START
-# ============================================================
+# =========================================================
+# =========================================================
+# НОВАЯ СИСТЕМА АЛЬБОМОВ
+# =========================================================
+# =========================================================
+
+
+# =========================================================
+# СОЗДАНИЕ АЛЬБОМА
+# =========================================================
+
+@app.post("/albums")
+def create_album():
+
+    title = request.form.get(
+        "title",
+        ""
+    ).strip()
+
+    description = request.form.get(
+        "description",
+        ""
+    ).strip()
+
+    incoming = get_uploaded_media()
+
+    if not incoming:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Альбом должен содержать "
+                "хотя бы одну страницу."
+        }), 400
+
+    if len(incoming) > MAX_ALBUM_ITEMS:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                f"В одном альбоме можно "
+                f"сохранить максимум "
+                f"{MAX_ALBUM_ITEMS} файлов."
+        }), 400
+
+    if not title:
+
+        title = "Новый альбом"
+
+    temp_paths = []
+    stored_media = []
+
+    try:
+
+        # -------------------------------------------------
+        # Сначала отправляем все страницы
+        # в Storage-канал.
+        # -------------------------------------------------
+
+        for file in incoming:
+
+            content_type = (
+                file.content_type or ""
+            ).lower()
+
+            if content_type.startswith(
+                "video/"
+            ):
+
+                media_type = "video"
+
+            elif content_type.startswith(
+                "image/"
+            ):
+
+                media_type = "photo"
+
+            else:
+
+                raise RuntimeError(
+                    "Неподдерживаемый тип файла: "
+                    f"{content_type or 'неизвестный'}"
+                )
+
+            path = save_temp_file(file)
+
+            if not path:
+                continue
+
+            temp_paths.append(path)
+
+            stored = save_media_to_storage(
+                path,
+                media_type
+            )
+
+            stored_media.append(
+                stored
+            )
+
+        if not stored_media:
+
+            raise RuntimeError(
+                "Не удалось сохранить "
+                "страницы альбома."
+            )
+
+        # -------------------------------------------------
+        # Создаем сам альбом.
+        # -------------------------------------------------
+
+        current_time = now_iso()
+
+        with db_lock:
+
+            conn = get_db()
+
+            cursor = conn.execute(
+                """
+                INSERT INTO albums
+                (
+                    title,
+                    description,
+                    created_at,
+                    updated_at,
+                    status
+                )
+                VALUES (?, ?, ?, ?, 'draft')
+                """,
+                (
+                    title,
+                    description,
+                    current_time,
+                    current_time
+                )
+            )
+
+            album_id = cursor.lastrowid
+
+            # -------------------------------------------------
+            # Записываем страницы по порядку.
+            # -------------------------------------------------
+
+            for position, item in enumerate(
+                stored_media,
+                start=1
+            ):
+
+                conn.execute(
+                    """
+                    INSERT INTO album_items
+                    (
+                        album_id,
+                        position,
+                        type,
+                        file_id,
+                        storage_message_id,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        album_id,
+                        position,
+                        item["type"],
+                        item["file_id"],
+                        item.get(
+                            "storage_message_id"
+                        ),
+                        current_time
+                    )
+                )
+
+            conn.commit()
+            conn.close()
+
+        return jsonify({
+
+            "ok": True,
+
+            "album_id":
+                album_id,
+
+            "title":
+                title,
+
+            "description":
+                description,
+
+            "items_count":
+                len(stored_media),
+
+            "photo_count":
+                sum(
+                    1
+                    for x in stored_media
+                    if x["type"] == "photo"
+                ),
+
+            "video_count":
+                sum(
+                    1
+                    for x in stored_media
+                    if x["type"] == "video"
+                )
+        })
+
+    except Exception as exc:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                str(exc)
+        }), 500
+
+    finally:
+
+        cleanup_files(
+            temp_paths
+        )
+
+# =========================================================
+# СПИСОК АЛЬБОМОВ
+# =========================================================
+
+@app.get("/albums")
+def list_albums():
+
+    with db_lock:
+
+        conn = get_db()
+
+        rows = conn.execute(
+            """
+            SELECT
+                a.*,
+                COUNT(ai.id) AS items_count
+            FROM albums a
+            LEFT JOIN album_items ai
+                ON ai.album_id = a.id
+            GROUP BY a.id
+            ORDER BY a.id DESC
+            """
+        ).fetchall()
+
+        conn.close()
+
+    items = []
+
+    for row in rows:
+
+        items.append({
+
+            "id":
+                row["id"],
+
+            "title":
+                row["title"],
+
+            "description":
+                row["description"],
+
+            "created_at":
+                row["created_at"],
+
+            "updated_at":
+                row["updated_at"],
+
+            "published_message_id":
+                row[
+                    "published_message_id"
+                ],
+
+            "status":
+                row["status"],
+
+            "items_count":
+                row["items_count"]
+        })
+
+    return jsonify({
+        "ok": True,
+        "items": items
+    })
+
+
+# =========================================================
+# ПОЛУЧИТЬ АЛЬБОМ
+# =========================================================
+
+@app.get(
+    "/albums/<int:album_id>"
+)
+def get_album(album_id):
+
+    with db_lock:
+
+        conn = get_db()
+
+        album = conn.execute(
+            """
+            SELECT *
+            FROM albums
+            WHERE id = ?
+            """,
+            (album_id,)
+        ).fetchone()
+
+        if not album:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Альбом не найден."
+            }), 404
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                position,
+                type,
+                storage_message_id
+            FROM album_items
+            WHERE album_id = ?
+            ORDER BY position ASC
+            """,
+            (album_id,)
+        ).fetchall()
+
+        conn.close()
+
+    items = []
+
+    for row in rows:
+
+        items.append({
+
+            "id":
+                row["id"],
+
+            "position":
+                row["position"],
+
+            "type":
+                row["type"],
+
+            "storage_message_id":
+                row[
+                    "storage_message_id"
+                ],
+
+            # URL, который потом будет
+            # использовать наш Mini App.
+            "url":
+                f"/albums/"
+                f"{album_id}/media/"
+                f"{row['position']}"
+        })
+
+    return jsonify({
+
+        "ok": True,
+
+        "album": {
+
+            "id":
+                album["id"],
+
+            "title":
+                album["title"],
+
+            "description":
+                album["description"],
+
+            "created_at":
+                album["created_at"],
+
+            "updated_at":
+                album["updated_at"],
+
+            "published_message_id":
+                album[
+                    "published_message_id"
+                ],
+
+            "status":
+                album["status"],
+
+            "items_count":
+                len(items),
+
+            "items":
+                items
+        }
+    })
+    # =========================================================
+# ПОЛУЧИТЬ FILE_ID АЛЬБОМА
+# =========================================================
+
+@app.get(
+    "/albums/<int:album_id>/media/<int:position>"
+)
+def album_media(album_id, position):
+
+    with db_lock:
+
+        conn = get_db()
+
+        item = conn.execute(
+            """
+            SELECT *
+            FROM album_items
+            WHERE album_id = ?
+              AND position = ?
+            """,
+            (
+                album_id,
+                position
+            )
+        ).fetchone()
+
+        conn.close()
+
+    if not item:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Страница альбома "
+                "не найдена."
+        }), 404
+
+    # -----------------------------------------------------
+    # Получаем file_path у Telegram.
+    # -----------------------------------------------------
+
+    result = telegram(
+        "getFile",
+        payload={
+            "file_id":
+                item["file_id"]
+        }
+    )
+
+    if not result.get("ok"):
+
+        return jsonify({
+            "ok": False,
+            "error":
+                result.get(
+                    "description",
+                    "Telegram не смог "
+                    "получить файл."
+                )
+        }), 500
+
+    file_path = (
+        result["result"]
+        .get("file_path")
+    )
+
+    if not file_path:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Telegram не вернул "
+                "путь к файлу."
+        }), 500
+
+    # -----------------------------------------------------
+    # Забираем файл с Telegram.
+    # -----------------------------------------------------
+
+    file_url = (
+        f"https://api.telegram.org/"
+        f"file/bot{BOT_TOKEN}/"
+        f"{file_path}"
+    )
+
+    try:
+
+        response = requests.get(
+            file_url,
+            timeout=120
+        )
+
+    except requests.RequestException as exc:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                f"Ошибка загрузки файла: {exc}"
+        }), 500
+
+    if response.status_code != 200:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Telegram не отдал файл."
+        }), 500
+
+    content_type = (
+        "video/mp4"
+        if item["type"] == "video"
+        else "image/jpeg"
+    )
+
+    return Response(
+        response.content,
+        status=200,
+        content_type=content_type,
+        headers={
+            "Cache-Control":
+                "public, max-age=86400",
+            "Access-Control-Allow-Origin":
+                "*"
+        }
+    )
+
+
+# =========================================================
+# УДАЛЕНИЕ АЛЬБОМА
+# =========================================================
+
+@app.delete(
+    "/albums/<int:album_id>"
+)
+def delete_album(album_id):
+
+    with db_lock:
+
+        conn = get_db()
+
+        album = conn.execute(
+            """
+            SELECT *
+            FROM albums
+            WHERE id = ?
+            """,
+            (album_id,)
+        ).fetchone()
+
+        if not album:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Альбом не найден."
+            }), 404
+
+        # SQLite foreign_keys не всегда
+        # включен автоматически.
+        conn.execute(
+            """
+            DELETE FROM album_items
+            WHERE album_id = ?
+            """,
+            (album_id,)
+        )
+
+        conn.execute(
+            """
+            DELETE FROM albums
+            WHERE id = ?
+            """,
+            (album_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+    return jsonify({
+        "ok": True
+    })
+
+
+# =========================================================
+# ПУБЛИКАЦИЯ АЛЬБОМА В КАНАЛ
+# =========================================================
+
+@app.post(
+    "/albums/<int:album_id>/publish"
+)
+def publish_album(album_id):
+
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    custom_text = str(
+        data.get(
+            "text",
+            ""
+        )
+    ).strip()
+
+    with db_lock:
+
+        conn = get_db()
+
+        album = conn.execute(
+            """
+            SELECT *
+            FROM albums
+            WHERE id = ?
+            """,
+            (album_id,)
+        ).fetchone()
+
+        if not album:
+
+            conn.close()
+
+            return jsonify({
+                "ok": False,
+                "error":
+                    "Альбом не найден."
+            }), 404
+
+        first_item = conn.execute(
+            """
+            SELECT *
+            FROM album_items
+            WHERE album_id = ?
+            ORDER BY position ASC
+            LIMIT 1
+            """,
+            (album_id,)
+        ).fetchone()
+
+        conn.close()
+
+    if not first_item:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "В альбоме нет страниц."
+        }), 400
+
+    # -----------------------------------------------------
+    # Ссылка на конкретный альбом.
+    #
+    # Пока используем обычную HTTPS-ссылку.
+    # Позже сделаем красивый полноценный
+    # Mini App reader.
+    # -----------------------------------------------------
+
+    album_url = (
+        f"{MINI_APP_URL}"
+        f"?album={album_id}"
+    )
+
+    caption_parts = []
+
+    if custom_text:
+        caption_parts.append(
+            custom_text
+        )
+
+    elif album["description"]:
+        caption_parts.append(
+            album["description"]
+        )
+
+    caption_parts.append(
+        f"📖 <b>{album['title']}</b>"
+    )
+
+    caption = "\n\n".join(
+        caption_parts
+    )
+
+    # -----------------------------------------------------
+    # Отправляем первую страницу
+    # -----------------------------------------------------
+
+    result = telegram(
+        "sendPhoto"
+        if first_item["type"] == "photo"
+        else "sendVideo",
+
+        payload={
+            "chat_id":
+                CHANNEL_USERNAME,
+
+            "caption":
+                caption,
+
+            "parse_mode":
+                "HTML",
+
+            "disable_notification":
+                "false",
+
+            "reply_markup":
+                json.dumps({
+                    "inline_keyboard": [[
+                        {
+                            "text":
+                                "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
+
+                            "url":
+                                album_url
+                        }
+                    ]]
+                }, ensure_ascii=False)
+        }
+    )
+
+    if not result.get("ok"):
+
+        return jsonify({
+            "ok": False,
+            "error":
+                result.get(
+                    "description",
+                    "Не удалось "
+                    "опубликовать альбом."
+                )
+        }), 500
+
+    message_id = (
+        result["result"]["message_id"]
+    )
+
+    with db_lock:
+
+        conn = get_db()
+
+        conn.execute(
+            """
+            UPDATE albums
+            SET
+                published_message_id = ?,
+                status = 'published',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                message_id,
+                now_iso(),
+                album_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    return jsonify({
+
+        "ok": True,
+
+        "album_id":
+            album_id,
+
+        "message_id":
+            message_id,
+
+        "album_url":
+            album_url
+    })
+
+
+# =========================================================
+# ЗАПУСК ПЛАНИРОВЩИКА
+# =========================================================
 
 def start_scheduler():
 
@@ -1616,7 +2524,9 @@ def start_scheduler():
 
 
 start_scheduler()
-
+# =========================================================
+# ЗАПУСК FLASK
+# =========================================================
 
 if __name__ == "__main__":
 
@@ -1628,4 +2538,4 @@ if __name__ == "__main__":
                 "10000"
             )
         )
-    )
+)
