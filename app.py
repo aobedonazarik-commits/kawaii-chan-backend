@@ -50,7 +50,10 @@ MINI_APP_URL = os.environ.get(
     "MINI_APP_URL",
     "https://aobedonazarik-commits.github.io/kawaii-chan-mini-app/"
 ).strip()
-
+BACKEND_URL = os.environ.get(
+    "BACKEND_URL",
+    "https://kawaii-chan-backend.onrender.com"
+).strip().rstrip("/")
 MAX_MEDIA = 100
 
 # Пока обычный Telegram Bot API.
@@ -2092,9 +2095,9 @@ def get_album(album_id):
             # URL, который потом будет
             # использовать наш Mini App.
             "url":
-                f"/albums/"
-                f"{album_id}/media/"
-                f"{row['position']}"
+    f"https://kawaii-chan-backend.onrender.com/albums/"
+    f"{album_id}/media/"
+    f"{row['position']}"
         })
 
     return jsonify({
