@@ -2425,50 +2425,50 @@ def publish_album(album_id):
     # Отправляем первую страницу
     # -----------------------------------------------------
 
-    publish_method = (
-    "sendPhoto"
-    if first_item["type"] == "photo"
-    else "sendVideo"
-)
-
-publish_payload = {
-    "chat_id":
-        CHANNEL_USERNAME,
-
-    "caption":
-        caption,
-
-    "parse_mode":
-        "HTML",
-
-    "disable_notification":
-        "false",
-
-    "reply_markup":
-        json.dumps({
-            "inline_keyboard": [[
-                {
-                    "text":
-                        "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
-                    "url":
-                        album_url
-                }
-            ]]
-        }, ensure_ascii=False)
-}
-
-if first_item["type"] == "photo":
-    publish_payload["photo"] = (
-        first_item["file_id"]
-    )
-else:
-    publish_payload["video"] = (
-        first_item["file_id"]
+        publish_method = (
+        "sendPhoto"
+        if first_item["type"] == "photo"
+        else "sendVideo"
     )
 
-result = telegram(
-    publish_method,
-    payload=publish_payload
+    publish_payload = {
+        "chat_id":
+            CHANNEL_USERNAME,
+
+        "caption":
+            caption,
+
+        "parse_mode":
+            "HTML",
+
+        "disable_notification":
+            "false",
+
+        "reply_markup":
+            json.dumps({
+                "inline_keyboard": [[
+                    {
+                        "text":
+                            "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
+                        "url":
+                            album_url
+                    }
+                ]]
+            }, ensure_ascii=False)
+    }
+
+    if first_item["type"] == "photo":
+        publish_payload["photo"] = (
+            first_item["file_id"]
+        )
+    else:
+        publish_payload["video"] = (
+            first_item["file_id"]
+        )
+
+    result = telegram(
+        publish_method,
+        payload=publish_payload
 )
 
     if not result.get("ok"):
