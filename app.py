@@ -947,13 +947,20 @@ def publish():
                 )
             }), 400
 
-        media_items = []
+                media_items = []
 
         if files:
-            media_items = # ============================================================
+            media_items = [
+                normalize_media_item(
+                    uploaded_file
+                )
+                for uploaded_file in files
+            ]
+
+
+# ============================================================
 # ALBUM CREATION
 # ============================================================
-
 @app.post("/albums")
 def create_album():
     temporary_paths = []
