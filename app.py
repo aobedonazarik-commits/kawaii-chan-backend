@@ -2058,7 +2058,7 @@ def create_album():
                     )
 
 
-                if file_size > MAX_ALBUM_FILE_SIZE:
+                f"{MAX_ALBUM_FILE_SIZE // (1024 * 1024)}
 
                     raise RuntimeError(
                         f"Страница #{position} "
