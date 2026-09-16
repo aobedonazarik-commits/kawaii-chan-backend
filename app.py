@@ -2006,51 +2006,24 @@ def create_album():
             # Никаких sendMediaGroup на 21–200 файлов.
             # ------------------------------------------------
 
-            for position, uploaded_file in enumerate(
-                uploaded_files,
-                start=1
-            ):
+            temporary_paths.append(
+                path
+            )
 
-                if not uploaded_file:
-                    continue
+            filename = (
+                uploaded_file.filename
+                or f"page_{position}"
+            )
 
+            mime_type = (
+                uploaded_file.mimetype
+                or mimetypes.guess_type(
+                    filename
+                )[0]
+                or ""
+            )
 
-                path = save_temp_file(
-                    uploaded_file
-                )
-
-
-                if not path:
-                    raise RuntimeError(
-                        f"Не удалось сохранить "
-                        f"страницу #{position}"
-                    )
-
-
-                temporary_paths.append(
-                    path
-                )
-
-
-                filename = (
-                    uploaded_file.filename
-                    or f"page_{position}"
-                )
-
-
-                mime_type = (
-                    uploaded_file.mimetype
-                    or mimetypes.guess_type(
-                        filename
-                    )[0]
-                    or ""
-                )
-
-
-                file_size = path.stat().st_size
-
-            
-
+            file_size = path.stat().st_size
 
             if file_size <= 0:
                 raise RuntimeError(
@@ -2069,20 +2042,17 @@ def create_album():
                 mime_type
             )
 
+            # --------------------------------------------
+            # Загружаем страницу отдельно.
+            # --------------------------------------------
 
-
-                # --------------------------------------------
-                # Загружаем страницу отдельно.
-                # --------------------------------------------
-
-                stored = (
-                    save_media_to_storage(
-                        path,
-                        filename=filename,
-                        mime_type=mime_type
-                    )
+            stored = (
+                save_media_to_storage(
+                    path,
+                    filename=filename,
+                    mime_type=mime_type
                 )
-
+            )
 
                 # --------------------------------------------
                 # Сохраняем Telegram file_id.
