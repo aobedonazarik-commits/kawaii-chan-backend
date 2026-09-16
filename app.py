@@ -5,9 +5,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 from flask_cors import CORS
 
 
@@ -44,24 +45,26 @@ UPLOAD_DIR.mkdir(
     exist_ok=True
 )
 
-# URL твоего Mini App.
-# Пока оставляем GitHub Pages.
 MINI_APP_URL = os.environ.get(
     "MINI_APP_URL",
     "https://aobedonazarik-commits.github.io/kawaii-chan-mini-app/"
-).strip()
+).strip().rstrip("/")
+
 BACKEND_URL = os.environ.get(
     "BACKEND_URL",
     "https://kawaii-chan-backend.onrender.com"
 ).strip().rstrip("/")
+
+
 MAX_MEDIA = 100
-
-# Пока обычный Telegram Bot API.
-MAX_VIDEO_SIZE = 50 * 1024 * 1024
-
-# Максимум страниц в одном альбоме.
 MAX_ALBUM_ITEMS = 200
 
+# Для обычных видео оставляем старый лимит.
+MAX_VIDEO_SIZE = 50 * 1024 * 1024
+
+# getFile Bot API позволяет скачивать до 20 MB.
+# Поэтому страницы альбомов ограничиваем 20 MB.
+MAX_ALBUM_FILE_SIZE = 20 * 1024 * 1024
 
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -69,7 +72,15 @@ TELEGRAM_API = (
 
 
 app = Flask(__name__)
-CORS(app)
+
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "*"
+        }
+    }
+)
 
 db_lock = threading.Lock()
 
@@ -84,8 +95,21 @@ def get_db():
         timeout=30,
         check_same_thread=False
     )
+
     conn.row_factory = sqlite3.Row
+
     return conn
+
+
+def table_columns(conn, table_name):
+    rows = conn.execute(
+        f"PRAGMA table_info({table_name})"
+    ).fetchall()
+
+    return {
+        row["name"]
+        for row in rows
+    }
 
 
 def init_db():
@@ -93,10 +117,6 @@ def init_db():
     with db_lock:
 
         conn = get_db()
-
-        # -------------------------------------------------
-        # Обычные посты
-        # -------------------------------------------------
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS posts (
@@ -108,10 +128,6 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-
-        # -------------------------------------------------
-        # Отложенные посты
-        # -------------------------------------------------
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_posts (
@@ -126,10 +142,6 @@ def init_db():
             )
         """)
 
-        # -------------------------------------------------
-        # НОВОЕ: альбомы
-        # -------------------------------------------------
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS albums (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,10 +153,6 @@ def init_db():
                 status TEXT DEFAULT 'draft'
             )
         """)
-
-        # -------------------------------------------------
-        # НОВОЕ: страницы альбомов
-        # -------------------------------------------------
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS album_items (
@@ -167,6 +175,47 @@ def init_db():
             ON album_items(album_id, position)
         """)
 
+        # -------------------------------------------------
+        # Миграция старых album_items.
+        # -------------------------------------------------
+
+        columns = table_columns(
+            conn,
+            "album_items"
+        )
+
+        if "storage_kind" not in columns:
+
+            conn.execute("""
+                ALTER TABLE album_items
+                ADD COLUMN storage_kind TEXT
+                DEFAULT 'photo'
+            """)
+
+        if "mime_type" not in columns:
+
+            conn.execute("""
+                ALTER TABLE album_items
+                ADD COLUMN mime_type TEXT
+                DEFAULT 'image/jpeg'
+            """)
+
+        if "file_name" not in columns:
+
+            conn.execute("""
+                ALTER TABLE album_items
+                ADD COLUMN file_name TEXT
+                DEFAULT ''
+            """)
+
+        if "file_size" not in columns:
+
+            conn.execute("""
+                ALTER TABLE album_items
+                ADD COLUMN file_size INTEGER
+                DEFAULT 0
+            """)
+
         conn.commit()
         conn.close()
 
@@ -175,28 +224,40 @@ init_db()
 
 
 # =========================================================
-# ВРЕМЯ
+# HELPERS
 # =========================================================
 
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-# =========================================================
-# TELEGRAM API
-# =========================================================
+def safe_json(value, default):
 
-def telegram(method, payload=None, files=None):
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def telegram(
+    method,
+    payload=None,
+    files=None
+):
 
     if not BOT_TOKEN:
+
         return {
             "ok": False,
-            "error": "BOT_TOKEN не настроен."
+            "description":
+                "BOT_TOKEN не настроен."
         }
 
     url = (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/{method}"
+        f"{TELEGRAM_API}/{method}"
     )
 
     try:
@@ -205,17 +266,18 @@ def telegram(method, payload=None, files=None):
             url,
             data=payload,
             files=files,
-            timeout=120
+            timeout=180
         )
 
         try:
             return response.json()
 
         except Exception:
+
             return {
                 "ok": False,
-                "error":
-                    f"Telegram вернул HTTP "
+                "description":
+                    f"Telegram HTTP "
                     f"{response.status_code}"
             }
 
@@ -223,27 +285,11 @@ def telegram(method, payload=None, files=None):
 
         return {
             "ok": False,
-            "error":
-                f"Ошибка соединения с Telegram: {exc}"
+            "description":
+                f"Ошибка соединения "
+                f"с Telegram: {exc}"
         }
 
-
-# =========================================================
-# JSON
-# =========================================================
-
-def safe_json(value, default):
-
-    try:
-        return json.loads(value)
-
-    except Exception:
-        return default
-
-
-# =========================================================
-# ВРЕМЕННЫЕ ФАЙЛЫ
-# =========================================================
 
 def save_temp_file(file):
 
@@ -281,8 +327,36 @@ def cleanup_files(paths):
             pass
 
 
+def get_uploaded_media():
+
+    files = []
+
+    files.extend(
+        request.files.getlist("photos")
+    )
+
+    files.extend(
+        request.files.getlist("media")
+    )
+
+    unique = []
+
+    seen = set()
+
+    for item in files:
+
+        marker = id(item)
+
+        if marker not in seen:
+
+            seen.add(marker)
+            unique.append(item)
+
+    return unique
+
+
 # =========================================================
-# STORAGE — ФОТО
+# ОБЫЧНЫЕ ПОСТЫ
 # =========================================================
 
 def save_photo_to_storage(path):
@@ -292,8 +366,10 @@ def save_photo_to_storage(path):
         result = telegram(
             "sendPhoto",
             payload={
-                "chat_id": STORAGE_CHAT_ID,
-                "disable_notification": "true"
+                "chat_id":
+                    STORAGE_CHAT_ID,
+                "disable_notification":
+                    "true"
             },
             files={
                 "photo": (
@@ -323,23 +399,17 @@ def save_photo_to_storage(path):
     if not photos:
 
         raise RuntimeError(
-            "Telegram не вернул "
-            "file_id фотографии."
+            "Telegram не вернул file_id фотографии."
         )
-
-    file_id = photos[-1]["file_id"]
 
     return {
         "type": "photo",
-        "file_id": file_id,
+        "file_id":
+            photos[-1]["file_id"],
         "storage_message_id":
             message.get("message_id")
     }
 
-
-# =========================================================
-# STORAGE — ВИДЕО
-# =========================================================
 
 def save_video_to_storage(path):
 
@@ -356,9 +426,12 @@ def save_video_to_storage(path):
         result = telegram(
             "sendVideo",
             payload={
-                "chat_id": STORAGE_CHAT_ID,
-                "supports_streaming": "true",
-                "disable_notification": "true"
+                "chat_id":
+                    STORAGE_CHAT_ID,
+                "supports_streaming":
+                    "true",
+                "disable_notification":
+                    "true"
             },
             files={
                 "video": (
@@ -387,8 +460,7 @@ def save_video_to_storage(path):
     if not video_data:
 
         raise RuntimeError(
-            "Telegram не вернул "
-            "file_id видео."
+            "Telegram не вернул file_id видео."
         )
 
     return {
@@ -400,55 +472,21 @@ def save_video_to_storage(path):
     }
 
 
-# =========================================================
-# STORAGE — ОБЩАЯ ФУНКЦИЯ
-# =========================================================
-
 def save_media_to_storage(
     path,
     media_type
 ):
 
     if media_type == "video":
-        return save_video_to_storage(path)
 
-    return save_photo_to_storage(path)
+        return save_video_to_storage(
+            path
+        )
 
-
-# =========================================================
-# ПОЛУЧЕНИЕ ЗАГРУЖЕННЫХ ФАЙЛОВ
-# =========================================================
-
-def get_uploaded_media():
-
-    files = []
-
-    files.extend(
-        request.files.getlist("photos")
+    return save_photo_to_storage(
+        path
     )
 
-    files.extend(
-        request.files.getlist("media")
-    )
-
-    unique = []
-    seen = set()
-
-    for item in files:
-
-        marker = id(item)
-
-        if marker not in seen:
-
-            seen.add(marker)
-            unique.append(item)
-
-    return unique
-
-
-# =========================================================
-# ЗАГРУЗКА МЕДИА В STORAGE
-# =========================================================
 
 def upload_request_media_to_storage():
 
@@ -488,10 +526,15 @@ def upload_request_media_to_storage():
 
                 raise RuntimeError(
                     "Неподдерживаемый тип файла: "
-                    f"{content_type or 'неизвестный'}"
+                    + (
+                        content_type
+                        or "неизвестный"
+                    )
                 )
 
-            path = save_temp_file(file)
+            path = save_temp_file(
+                file
+            )
 
             if not path:
                 continue
@@ -516,10 +559,6 @@ def upload_request_media_to_storage():
         )
 
 
-# =========================================================
-# ПУБЛИКАЦИЯ MEDIA GROUP
-# =========================================================
-
 def publish_media_group(
     media,
     caption=""
@@ -527,7 +566,7 @@ def publish_media_group(
 
     telegram_media = []
 
-    for index, item in enumerate(media):
+    for item in media:
 
         media_type = item["type"]
 
@@ -535,22 +574,28 @@ def publish_media_group(
 
             obj = {
                 "type": "photo",
-                "media": item["file_id"]
+                "media":
+                    item["file_id"]
             }
 
         elif media_type == "video":
 
             obj = {
                 "type": "video",
-                "media": item["file_id"],
-                "supports_streaming": True
+                "media":
+                    item["file_id"],
+                "supports_streaming":
+                    True
             }
 
         else:
 
             continue
 
-        if index == 0 and caption:
+        if (
+            not telegram_media
+            and caption
+        ):
 
             obj["caption"] = caption
             obj["parse_mode"] = "HTML"
@@ -572,7 +617,6 @@ def publish_media_group(
         payload={
             "chat_id":
                 CHANNEL_USERNAME,
-
             "media":
                 json.dumps(
                     telegram_media,
@@ -581,10 +625,6 @@ def publish_media_group(
         }
     )
 
-
-# =========================================================
-# ПУБЛИКАЦИЯ СОХРАНЕННОГО МЕДИА
-# =========================================================
 
 def publish_stored_media(
     media,
@@ -598,10 +638,8 @@ def publish_stored_media(
             payload={
                 "chat_id":
                     CHANNEL_USERNAME,
-
                 "text":
                     text,
-
                 "parse_mode":
                     "HTML"
             }
@@ -662,16 +700,15 @@ def publish_stored_media(
                 message["message_id"]
             )
 
-        if group_index < len(groups) - 1:
+        if (
+            group_index
+            < len(groups) - 1
+        ):
 
-            time.sleep(0.5)
+            time.sleep(0.7)
 
     return message_ids
 
-
-# =========================================================
-# ИСТОРИЯ ПОСТОВ
-# =========================================================
 
 def save_post_history(
     message_ids,
@@ -689,8 +726,7 @@ def save_post_history(
 
         conn = get_db()
 
-        conn.execute(
-            """
+        conn.execute("""
             INSERT INTO posts
             (
                 telegram_message_ids,
@@ -700,31 +736,23 @@ def save_post_history(
                 created_at
             )
             VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                json.dumps(
-                    message_ids
-                ),
-
-                text,
-
-                json.dumps(
-                    media,
-                    ensure_ascii=False
-                ),
-
-                post_type,
-
-                now_iso()
-            )
-        )
+        """, (
+            json.dumps(message_ids),
+            text,
+            json.dumps(
+                media,
+                ensure_ascii=False
+            ),
+            post_type,
+            now_iso()
+        ))
 
         conn.commit()
         conn.close()
 
 
 # =========================================================
-# ГЛАВНАЯ
+# SERVICE
 # =========================================================
 
 @app.get("/")
@@ -746,10 +774,6 @@ def home():
             now_iso()
     })
 
-
-# =========================================================
-# TEST BOT
-# =========================================================
 
 @app.get("/test")
 def test():
@@ -780,10 +804,6 @@ def test():
     })
 
 
-# =========================================================
-# STORAGE TEST
-# =========================================================
-
 @app.get("/storage-test")
 def storage_test():
 
@@ -792,7 +812,6 @@ def storage_test():
         payload={
             "chat_id":
                 STORAGE_CHAT_ID,
-
             "text":
                 "Kawaii Chan Storage test"
         }
@@ -814,15 +833,9 @@ def storage_test():
         "message":
             "Storage-канал работает.",
         "message_id":
-            result["result"]["message_id"],
-        "storage_chat_id":
-            STORAGE_CHAT_ID
+            result["result"]["message_id"]
     })
 
-
-# =========================================================
-# WEBAPP TEST
-# =========================================================
 
 @app.post("/webapp")
 def webapp():
@@ -841,10 +854,11 @@ def webapp():
 
 
 # =========================================================
-# ОБЫЧНАЯ ПУБЛИКАЦИЯ
+# PUBLISH
 # =========================================================
 
 @app.post("/publish")
+@app.post("/posts")
 def publish():
 
     text = request.form.get(
@@ -870,30 +884,23 @@ def publish():
 
     try:
 
-        if request.is_json:
-
-            media = []
-
-        else:
-
-            media = (
-                upload_request_media_to_storage()
-            )
+        media = (
+            []
+            if request.is_json
+            else upload_request_media_to_storage()
+        )
 
         if not text and not media:
 
             return jsonify({
                 "ok": False,
                 "error":
-                    "Нужен текст "
-                    "или хотя бы один файл."
+                    "Нужен текст или хотя бы один файл."
             }), 400
 
-        message_ids = (
-            publish_stored_media(
-                media,
-                text
-            )
+        message_ids = publish_stored_media(
+            media,
+            text
         )
 
         save_post_history(
@@ -910,14 +917,12 @@ def publish():
                 len(media),
             "photo_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x["type"] == "photo"
                 ),
             "video_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x["type"] == "video"
                 )
         })
@@ -932,10 +937,11 @@ def publish():
 
 
 # =========================================================
-# ОТЛОЖЕННЫЙ ПОСТ
+# SCHEDULE
 # =========================================================
 
 @app.post("/schedule")
+@app.post("/scheduled")
 def schedule():
 
     text = request.form.get(
@@ -977,23 +983,39 @@ def schedule():
 
         media = (
             upload_request_media_to_storage()
+            if not request.is_json
+            else []
         )
+
+        if request.is_json:
+
+            data = (
+                request.get_json(
+                    silent=True
+                )
+                or {}
+            )
+
+            text = str(
+                data.get(
+                    "text",
+                    text
+                )
+            ).strip()
 
         if not text and not media:
 
             return jsonify({
                 "ok": False,
                 "error":
-                              "Нужен текст "
-                    "или хотя бы один файл."
+                    "Нужен текст или хотя бы один файл."
             }), 400
 
         with db_lock:
 
             conn = get_db()
 
-            cursor = conn.execute(
-                """
+            cursor = conn.execute("""
                 INSERT INTO scheduled_posts
                 (
                     text,
@@ -1003,20 +1025,15 @@ def schedule():
                     created_at
                 )
                 VALUES (?, ?, ?, 'pending', ?)
-                """,
-                (
-                    text,
-
-                    run_at,
-
-                    json.dumps(
-                        media,
-                        ensure_ascii=False
-                    ),
-
-                    now_iso()
-                )
-            )
+            """, (
+                text,
+                run_at,
+                json.dumps(
+                    media,
+                    ensure_ascii=False
+                ),
+                now_iso()
+            ))
 
             job_id = cursor.lastrowid
 
@@ -1033,14 +1050,12 @@ def schedule():
                 len(media),
             "photo_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x["type"] == "photo"
                 ),
             "video_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x["type"] == "video"
                 )
         })
@@ -1054,10 +1069,6 @@ def schedule():
         }), 500
 
 
-# =========================================================
-# СПИСОК ОТЛОЖЕННЫХ
-# =========================================================
-
 @app.get("/scheduled")
 def scheduled():
 
@@ -1065,13 +1076,11 @@ def scheduled():
 
         conn = get_db()
 
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT *
             FROM scheduled_posts
             ORDER BY run_at ASC
-            """
-        ).fetchall()
+        """).fetchall()
 
         conn.close()
 
@@ -1085,54 +1094,40 @@ def scheduled():
         )
 
         items.append({
-
             "id":
                 row["id"],
-
             "text":
                 row["text"],
-
             "run_at":
                 row["run_at"],
-
             "status":
                 row["status"],
-
             "created_at":
                 row["created_at"],
-
             "published_at":
                 row["published_at"],
-
             "error":
                 row["error"],
-
             "media_count":
                 len(media),
-
             "photo_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x.get("type") == "photo"
                 ),
-
             "video_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x.get("type") == "video"
                 )
         })
 
     return jsonify({
         "ok": True,
-        "items": items
+        "items":
+            items
     })
 
-# =========================================================
-# ОТМЕНА ОТЛОЖЕННОГО
-# =========================================================
 
 @app.delete(
     "/scheduled/<int:post_id>"
@@ -1143,14 +1138,13 @@ def cancel_scheduled(post_id):
 
         conn = get_db()
 
-        row = conn.execute(
-            """
+        row = conn.execute("""
             SELECT *
             FROM scheduled_posts
             WHERE id = ?
-            """,
-            (post_id,)
-        ).fetchone()
+        """, (
+            post_id,
+        )).fetchone()
 
         if not row:
 
@@ -1172,14 +1166,13 @@ def cancel_scheduled(post_id):
                     "Этот пост уже обработан."
             }), 400
 
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE scheduled_posts
             SET status = 'cancelled'
             WHERE id = ?
-            """,
-            (post_id,)
-        )
+        """, (
+            post_id,
+        ))
 
         conn.commit()
         conn.close()
@@ -1190,29 +1183,25 @@ def cancel_scheduled(post_id):
 
 
 # =========================================================
-# ПЛАНИРОВЩИК
+# SCHEDULER
 # =========================================================
 
 def process_due_posts():
 
-    current = (
-        datetime.now(
-            timezone.utc
-        )
+    current = datetime.now(
+        timezone.utc
     )
 
     with db_lock:
 
         conn = get_db()
 
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT *
             FROM scheduled_posts
             WHERE status = 'pending'
             ORDER BY run_at ASC
-            """
-        ).fetchall()
+        """).fetchall()
 
         conn.close()
 
@@ -1234,6 +1223,7 @@ def process_due_posts():
                 )
 
             if run_at > current:
+
                 continue
 
             media = safe_json(
@@ -1241,11 +1231,9 @@ def process_due_posts():
                 []
             )
 
-            message_ids = (
-                publish_stored_media(
-                    media,
-                    row["text"] or ""
-                )
+            message_ids = publish_stored_media(
+                media,
+                row["text"] or ""
             )
 
             save_post_history(
@@ -1258,20 +1246,17 @@ def process_due_posts():
 
                 conn = get_db()
 
-                conn.execute(
-                    """
+                conn.execute("""
                     UPDATE scheduled_posts
                     SET
                         status = 'published',
                         published_at = ?,
                         error = NULL
                     WHERE id = ?
-                    """,
-                    (
-                        now_iso(),
-                        row["id"]
-                    )
-                )
+                """, (
+                    now_iso(),
+                    row["id"]
+                ))
 
                 conn.commit()
                 conn.close()
@@ -1282,27 +1267,22 @@ def process_due_posts():
 
                 conn = get_db()
 
-                conn.execute(
-                    """
+                conn.execute("""
                     UPDATE scheduled_posts
                     SET
                         status = 'error',
                         error = ?
                     WHERE id = ?
-                    """,
-                    (
-                        str(exc),
-                        row["id"]
-                    )
-                )
+                """, (
+                    str(exc),
+                    row["id"]
+                ))
 
                 conn.commit()
                 conn.close()
 
 
-@app.get(
-    "/scheduler/tick"
-)
+@app.get("/scheduler/tick")
 def scheduler_tick():
 
     process_due_posts()
@@ -1328,7 +1308,7 @@ def scheduler_loop():
 
 
 # =========================================================
-# ИСТОРИЯ ПОСТОВ
+# POSTS
 # =========================================================
 
 @app.get("/posts")
@@ -1338,14 +1318,12 @@ def posts():
 
         conn = get_db()
 
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT *
             FROM posts
             ORDER BY id DESC
             LIMIT 100
-            """
-        ).fetchall()
+        """).fetchall()
 
         conn.close()
 
@@ -1359,19 +1337,14 @@ def posts():
         )
 
         items.append({
-
             "id":
                 row["id"],
-
             "text":
                 row["text"],
-
             "post_type":
                 row["post_type"],
-
             "created_at":
                 row["created_at"],
-
             "telegram_message_ids":
                 safe_json(
                     row[
@@ -1379,32 +1352,26 @@ def posts():
                     ],
                     []
                 ),
-
             "media_count":
                 len(media),
-
             "photo_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x.get("type") == "photo"
                 ),
-
             "video_count":
                 sum(
-                    1
-                    for x in media
+                    1 for x in media
                     if x.get("type") == "video"
                 )
         })
 
     return jsonify({
         "ok": True,
-        "items": items
+        "items":
+            items
     })
-# =========================================================
-# РЕДАКТИРОВАНИЕ ПОСТА
-# =========================================================
+
 
 @app.post("/posts/edit")
 def edit_post():
@@ -1439,14 +1406,13 @@ def edit_post():
 
         conn = get_db()
 
-        row = conn.execute(
-            """
+        row = conn.execute("""
             SELECT *
             FROM posts
             WHERE id = ?
-            """,
-            (post_id,)
-        ).fetchone()
+        """, (
+            post_id,
+        )).fetchone()
 
         if not row:
 
@@ -1480,13 +1446,10 @@ def edit_post():
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
-
                     "message_id":
                         message_ids[0],
-
                     "text":
                         new_text,
-
                     "parse_mode":
                         "HTML"
                 }
@@ -1499,13 +1462,10 @@ def edit_post():
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
-
                     "message_id":
                         message_ids[0],
-
                     "caption":
                         new_text,
-
                     "parse_mode":
                         "HTML"
                 }
@@ -1520,22 +1480,18 @@ def edit_post():
                 "error":
                     result.get(
                         "description",
-                        "Telegram не смог "
-                        "изменить пост."
+                        "Telegram не смог изменить пост."
                     )
             }), 500
 
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE posts
             SET text = ?
             WHERE id = ?
-            """,
-            (
-                new_text,
-                post_id
-            )
-        )
+        """, (
+            new_text,
+            post_id
+        ))
 
         conn.commit()
         conn.close()
@@ -1544,9 +1500,6 @@ def edit_post():
         "ok": True
     })
 
-# =========================================================
-# УДАЛЕНИЕ ПОСТА
-# =========================================================
 
 @app.delete(
     "/posts/<int:post_id>"
@@ -1557,14 +1510,13 @@ def delete_post(post_id):
 
         conn = get_db()
 
-        row = conn.execute(
-            """
+        row = conn.execute("""
             SELECT *
             FROM posts
             WHERE id = ?
-            """,
-            (post_id,)
-        ).fetchone()
+        """, (
+            post_id,
+        )).fetchone()
 
         if not row:
 
@@ -1590,7 +1542,6 @@ def delete_post(post_id):
                 payload={
                     "chat_id":
                         CHANNEL_USERNAME,
-
                     "message_id":
                         message_id
                 }
@@ -1605,13 +1556,12 @@ def delete_post(post_id):
                     )
                 )
 
-        conn.execute(
-            """
+        conn.execute("""
             DELETE FROM posts
             WHERE id = ?
-            """,
-            (post_id,)
-        )
+        """, (
+            post_id,
+        ))
 
         conn.commit()
         conn.close()
@@ -1627,8 +1577,10 @@ def delete_post(post_id):
     return jsonify({
         "ok": True
     })
+
+
 # =========================================================
-# СТАТИСТИКА
+# STATS
 # =========================================================
 
 @app.get("/stats")
@@ -1643,110 +1595,319 @@ def stats():
         ).fetchone()[0]
 
         scheduled_total = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM scheduled_posts
-            """
+            "SELECT COUNT(*) FROM scheduled_posts"
         ).fetchone()[0]
 
-        scheduled_pending = conn.execute(
-            """
+        scheduled_pending = conn.execute("""
             SELECT COUNT(*)
             FROM scheduled_posts
             WHERE status = 'pending'
-            """
-        ).fetchone()[0]
+        """).fetchone()[0]
 
-        scheduled_published = conn.execute(
-            """
+        scheduled_published = conn.execute("""
             SELECT COUNT(*)
             FROM scheduled_posts
             WHERE status = 'published'
-            """
-        ).fetchone()[0]
+        """).fetchone()[0]
 
-        scheduled_errors = conn.execute(
-            """
+        scheduled_errors = conn.execute("""
             SELECT COUNT(*)
             FROM scheduled_posts
             WHERE status = 'error'
-            """
-        ).fetchone()[0]
+        """).fetchone()[0]
 
         total_albums = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM albums
-            """
+            "SELECT COUNT(*) FROM albums"
         ).fetchone()[0]
 
         conn.close()
 
     return jsonify({
-
         "ok": True,
-
         "stats": {
-
             "published_posts":
                 total_posts,
-
             "scheduled_total":
                 scheduled_total,
-
             "scheduled_pending":
                 scheduled_pending,
-
             "scheduled_published":
                 scheduled_published,
-
             "scheduled_errors":
                 scheduled_errors,
-
             "albums":
                 total_albums
         }
     })
+
+
 # =========================================================
-# НАСТРОЙКИ
+# SETTINGS
 # =========================================================
 
 @app.get("/settings")
 def settings():
 
     return jsonify({
-
         "ok": True,
-
         "channel":
             CHANNEL_USERNAME,
-
         "storage_chat_id":
             STORAGE_CHAT_ID,
-
         "max_media":
             MAX_MEDIA,
-
         "max_video_size_mb":
             50,
-
         "max_album_items":
             MAX_ALBUM_ITEMS,
-
+        "max_album_file_size_mb":
+            20,
         "mini_app_url":
             MINI_APP_URL
     })
 
 
 # =========================================================
+# ALBUM HELPERS
 # =========================================================
-# НОВАЯ СИСТЕМА АЛЬБОМОВ
-# =========================================================
-# =========================================================
+
+def save_album_image_as_document(
+    path
+):
+
+    size = Path(path).stat().st_size
+
+    if size > MAX_ALBUM_FILE_SIZE:
+
+        raise RuntimeError(
+            f"Страница больше "
+            f"{MAX_ALBUM_FILE_SIZE // 1024 // 1024} МБ."
+        )
+
+    mime = (
+        "application/octet-stream"
+    )
+
+    original_name = Path(
+        path
+    ).name
+
+    lower = original_name.lower()
+
+    if lower.endswith(
+        (".jpg", ".jpeg")
+    ):
+        mime = "image/jpeg"
+
+    elif lower.endswith(".png"):
+        mime = "image/png"
+
+    elif lower.endswith(".webp"):
+        mime = "image/webp"
+
+    elif lower.endswith(".gif"):
+        mime = "image/gif"
+
+    elif lower.endswith(".bmp"):
+        mime = "image/bmp"
+
+    elif lower.endswith(".avif"):
+        mime = "image/avif"
+
+    else:
+
+        content = None
+
+        try:
+            with open(
+                path,
+                "rb"
+            ) as f:
+                content = f.read(16)
+
+        except Exception:
+            pass
+
+        if (
+            content
+            and content.startswith(b"\xff\xd8\xff")
+        ):
+            mime = "image/jpeg"
+
+        elif (
+            content
+            and content.startswith(b"\x89PNG")
+        ):
+            mime = "image/png"
+
+        elif (
+            content
+            and content.startswith(b"RIFF")
+            and b"WEBP" in content
+        ):
+            mime = "image/webp"
+
+        else:
+
+            raise RuntimeError(
+                "Не удалось определить формат "
+                "изображения. Используй JPG, "
+                "PNG или WEBP."
+            )
+
+    with open(
+        path,
+        "rb"
+    ) as document:
+
+        result = telegram(
+            "sendDocument",
+            payload={
+                "chat_id":
+                    STORAGE_CHAT_ID,
+                "disable_notification":
+                    "true",
+                "disable_content_type_detection":
+                    "true"
+            },
+            files={
+                "document": (
+                    original_name,
+                    document,
+                    mime
+                )
+            }
+        )
+
+    if not result.get("ok"):
+
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram не принял страницу."
+            )
+        )
+
+    message = result["result"]
+
+    document_data = message.get(
+        "document"
+    )
+
+    if not document_data:
+
+        raise RuntimeError(
+            "Telegram не вернул document file_id."
+        )
+
+    return {
+        "type":
+            "photo",
+        "storage_kind":
+            "document",
+        "file_id":
+            document_data["file_id"],
+        "storage_message_id":
+            message.get("message_id"),
+        "mime_type":
+            document_data.get(
+                "mime_type",
+                mime
+            ),
+        "file_name":
+            document_data.get(
+                "file_name",
+                original_name
+            ),
+        "file_size":
+            document_data.get(
+                "file_size",
+                size
+            )
+    }
+
+
+def save_album_video(
+    path
+):
+
+    size = Path(path).stat().st_size
+
+    if size > MAX_ALBUM_FILE_SIZE:
+
+        raise RuntimeError(
+            "Видео в альбоме должно быть "
+            "не больше 20 МБ."
+        )
+
+    with open(
+        path,
+        "rb"
+    ) as video:
+
+        result = telegram(
+            "sendVideo",
+            payload={
+                "chat_id":
+                    STORAGE_CHAT_ID,
+                "supports_streaming":
+                    "true",
+                "disable_notification":
+                    "true"
+            },
+            files={
+                "video": (
+                    Path(path).name,
+                    video,
+                    "video/mp4"
+                )
+            }
+        )
+
+    if not result.get("ok"):
+
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram не принял видео."
+            )
+        )
+
+    message = result["result"]
+
+    video_data = message.get(
+        "video"
+    )
+
+    if not video_data:
+
+        raise RuntimeError(
+            "Telegram не вернул video file_id."
+        )
+
+    return {
+        "type":
+            "video",
+        "storage_kind":
+            "video",
+        "file_id":
+            video_data["file_id"],
+        "storage_message_id":
+            message.get("message_id"),
+        "mime_type":
+            "video/mp4",
+        "file_name":
+            Path(path).name,
+        "file_size":
+            video_data.get(
+                "file_size",
+                size
+            )
+    }
 
 
 # =========================================================
-# СОЗДАНИЕ АЛЬБОМА
+# CREATE ALBUM
 # =========================================================
 
 @app.post("/albums")
@@ -1778,9 +1939,8 @@ def create_album():
         return jsonify({
             "ok": False,
             "error":
-                f"В одном альбоме можно "
-                f"сохранить максимум "
-                f"{MAX_ALBUM_ITEMS} файлов."
+                f"Максимум "
+                f"{MAX_ALBUM_ITEMS} страниц."
         }), 400
 
     if not title:
@@ -1792,12 +1952,15 @@ def create_album():
 
     try:
 
-        # -------------------------------------------------
-        # Сначала отправляем все страницы
-        # в Storage-канал.
-        # -------------------------------------------------
+        # Сохраняем файлы в Telegram.
+        # Картинки идут как DOCUMENT,
+        # поэтому Telegram не пытается
+        # обрабатывать их как sendPhoto.
 
-        for file in incoming:
+        for index, file in enumerate(
+            incoming,
+            start=1
+        ):
 
             content_type = (
                 file.content_type or ""
@@ -1818,21 +1981,37 @@ def create_album():
             else:
 
                 raise RuntimeError(
-                    "Неподдерживаемый тип файла: "
-                    f"{content_type or 'неизвестный'}"
+                    f"Страница {index}: "
+                    f"неподдерживаемый тип "
+                    f"{content_type or 'неизвестный'}."
                 )
 
-            path = save_temp_file(file)
+            path = save_temp_file(
+                file
+            )
 
             if not path:
-                continue
+
+                raise RuntimeError(
+                    f"Страница {index}: "
+                    f"файл пустой."
+                )
 
             temp_paths.append(path)
 
-            stored = save_media_to_storage(
-                path,
-                media_type
-            )
+            if media_type == "photo":
+
+                stored = (
+                    save_album_image_as_document(
+                        path
+                    )
+                )
+
+            else:
+
+                stored = save_album_video(
+                    path
+                )
 
             stored_media.append(
                 stored
@@ -1845,18 +2024,13 @@ def create_album():
                 "страницы альбома."
             )
 
-        # -------------------------------------------------
-        # Создаем сам альбом.
-        # -------------------------------------------------
-
         current_time = now_iso()
 
         with db_lock:
 
             conn = get_db()
 
-            cursor = conn.execute(
-                """
+            cursor = conn.execute("""
                 INSERT INTO albums
                 (
                     title,
@@ -1866,28 +2040,21 @@ def create_album():
                     status
                 )
                 VALUES (?, ?, ?, ?, 'draft')
-                """,
-                (
-                    title,
-                    description,
-                    current_time,
-                    current_time
-                )
-            )
+            """, (
+                title,
+                description,
+                current_time,
+                current_time
+            ))
 
             album_id = cursor.lastrowid
-
-            # -------------------------------------------------
-            # Записываем страницы по порядку.
-            # -------------------------------------------------
 
             for position, item in enumerate(
                 stored_media,
                 start=1
             ):
 
-                conn.execute(
-                    """
+                conn.execute("""
                     INSERT INTO album_items
                     (
                         album_id,
@@ -1895,52 +2062,61 @@ def create_album():
                         type,
                         file_id,
                         storage_message_id,
-                        created_at
+                        created_at,
+                        storage_kind,
+                        mime_type,
+                        file_name,
+                        file_size
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        album_id,
-                        position,
-                        item["type"],
-                        item["file_id"],
-                        item.get(
-                            "storage_message_id"
-                        ),
-                        current_time
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    album_id,
+                    position,
+                    item["type"],
+                    item["file_id"],
+                    item.get(
+                        "storage_message_id"
+                    ),
+                    current_time,
+                    item.get(
+                        "storage_kind",
+                        "photo"
+                    ),
+                    item.get(
+                        "mime_type",
+                        "image/jpeg"
+                    ),
+                    item.get(
+                        "file_name",
+                        ""
+                    ),
+                    item.get(
+                        "file_size",
+                        0
                     )
-                )
+                ))
 
             conn.commit()
             conn.close()
 
         return jsonify({
-
             "ok": True,
-
             "album_id":
                 album_id,
-
             "title":
                 title,
-
             "description":
                 description,
-
             "items_count":
                 len(stored_media),
-
             "photo_count":
                 sum(
-                    1
-                    for x in stored_media
+                    1 for x in stored_media
                     if x["type"] == "photo"
                 ),
-
             "video_count":
                 sum(
-                    1
-                    for x in stored_media
+                    1 for x in stored_media
                     if x["type"] == "video"
                 )
         })
@@ -1959,8 +2135,9 @@ def create_album():
             temp_paths
         )
 
+
 # =========================================================
-# СПИСОК АЛЬБОМОВ
+# LIST ALBUMS
 # =========================================================
 
 @app.get("/albums")
@@ -1970,8 +2147,7 @@ def list_albums():
 
         conn = get_db()
 
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT
                 a.*,
                 COUNT(ai.id) AS items_count
@@ -1980,8 +2156,7 @@ def list_albums():
                 ON ai.album_id = a.id
             GROUP BY a.id
             ORDER BY a.id DESC
-            """
-        ).fetchall()
+        """).fetchall()
 
         conn.close()
 
@@ -1989,43 +2164,45 @@ def list_albums():
 
     for row in rows:
 
-        items.append({
+        first_url = None
 
+        if row["items_count"]:
+
+            first_url = (
+                f"{BACKEND_URL}/albums/"
+                f"{row['id']}/media/1"
+            )
+
+        items.append({
             "id":
                 row["id"],
-
             "title":
                 row["title"],
-
             "description":
                 row["description"],
-
             "created_at":
                 row["created_at"],
-
             "updated_at":
                 row["updated_at"],
-
             "published_message_id":
-                row[
-                    "published_message_id"
-                ],
-
+                row["published_message_id"],
             "status":
                 row["status"],
-
             "items_count":
-                row["items_count"]
+                row["items_count"],
+            "cover_url":
+                first_url
         })
 
     return jsonify({
         "ok": True,
-        "items": items
+        "items":
+            items
     })
 
 
 # =========================================================
-# ПОЛУЧИТЬ АЛЬБОМ
+# GET ALBUM
 # =========================================================
 
 @app.get(
@@ -2037,14 +2214,13 @@ def get_album(album_id):
 
         conn = get_db()
 
-        album = conn.execute(
-            """
+        album = conn.execute("""
             SELECT *
             FROM albums
             WHERE id = ?
-            """,
-            (album_id,)
-        ).fetchone()
+        """, (
+            album_id,
+        )).fetchone()
 
         if not album:
 
@@ -2056,19 +2232,22 @@ def get_album(album_id):
                     "Альбом не найден."
             }), 404
 
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT
                 id,
                 position,
                 type,
-                storage_message_id
+                storage_message_id,
+                storage_kind,
+                mime_type,
+                file_name,
+                file_size
             FROM album_items
             WHERE album_id = ?
             ORDER BY position ASC
-            """,
-            (album_id,)
-        ).fetchall()
+        """, (
+            album_id,
+        )).fetchall()
 
         conn.close()
 
@@ -2077,92 +2256,154 @@ def get_album(album_id):
     for row in rows:
 
         items.append({
-
             "id":
                 row["id"],
-
             "position":
                 row["position"],
-
             "type":
                 row["type"],
-
             "storage_message_id":
-                row[
-                    "storage_message_id"
-                ],
-
-            # URL, который потом будет
-            # использовать наш Mini App.
+                row["storage_message_id"],
+            "storage_kind":
+                row["storage_kind"],
+            "mime_type":
+                row["mime_type"],
+            "file_name":
+                row["file_name"],
+            "file_size":
+                row["file_size"],
             "url":
-    f"https://kawaii-chan-backend.onrender.com/albums/"
-    f"{album_id}/media/"
-    f"{row['position']}"
+                f"{BACKEND_URL}/albums/"
+                f"{album_id}/media/"
+                f"{row['position']}",
+            "download_url":
+                f"{BACKEND_URL}/albums/"
+                f"{album_id}/download/"
+                f"{row['position']}"
         })
 
     return jsonify({
-
         "ok": True,
-
         "album": {
-
             "id":
                 album["id"],
-
             "title":
                 album["title"],
-
             "description":
                 album["description"],
-
             "created_at":
                 album["created_at"],
-
             "updated_at":
                 album["updated_at"],
-
             "published_message_id":
                 album[
                     "published_message_id"
                 ],
-
             "status":
                 album["status"],
-
             "items_count":
                 len(items),
-
             "items":
                 items
         }
     })
-    # =========================================================
-# ПОЛУЧИТЬ FILE_ID АЛЬБОМА
+
+
+# =========================================================
+# MEDIA
 # =========================================================
 
-@app.get(
-    "/albums/<int:album_id>/media/<int:position>"
-)
-def album_media(album_id, position):
+def get_album_item(
+    album_id,
+    position
+):
 
     with db_lock:
 
         conn = get_db()
 
-        item = conn.execute(
-            """
+        item = conn.execute("""
             SELECT *
             FROM album_items
             WHERE album_id = ?
               AND position = ?
-            """,
-            (
-                album_id,
-                position
-            )
-        ).fetchone()
+        """, (
+            album_id,
+            position
+        )).fetchone()
 
         conn.close()
+
+    return item
+
+
+def fetch_telegram_file(
+    file_id
+):
+
+    result = telegram(
+        "getFile",
+        payload={
+            "file_id":
+                file_id
+        }
+    )
+
+    if not result.get("ok"):
+
+        raise RuntimeError(
+            result.get(
+                "description",
+                "Telegram не смог "
+                "подготовить файл."
+            )
+        )
+
+    file_path = (
+        result["result"].get(
+            "file_path"
+        )
+    )
+
+    if not file_path:
+
+        raise RuntimeError(
+            "Telegram не вернул "
+            "file_path."
+        )
+
+    file_url = (
+        f"https://api.telegram.org/"
+        f"file/bot{BOT_TOKEN}/"
+        f"{file_path}"
+    )
+
+    response = requests.get(
+        file_url,
+        timeout=180
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            "Telegram не отдал файл."
+        )
+
+    return response
+
+
+@app.get(
+    "/albums/<int:album_id>/media/<int:position>"
+)
+def album_media(
+    album_id,
+    position
+):
+
+    item = get_album_item(
+        album_id,
+        position
+    )
 
     if not item:
 
@@ -2173,81 +2414,27 @@ def album_media(album_id, position):
                 "не найдена."
         }), 404
 
-    # -----------------------------------------------------
-    # Получаем file_path у Telegram.
-    # -----------------------------------------------------
-
-    result = telegram(
-        "getFile",
-        payload={
-            "file_id":
-                item["file_id"]
-        }
-    )
-
-    if not result.get("ok"):
-
-        return jsonify({
-            "ok": False,
-            "error":
-                result.get(
-                    "description",
-                    "Telegram не смог "
-                    "получить файл."
-                )
-        }), 500
-
-    file_path = (
-        result["result"]
-        .get("file_path")
-    )
-
-    if not file_path:
-
-        return jsonify({
-            "ok": False,
-            "error":
-                "Telegram не вернул "
-                "путь к файлу."
-        }), 500
-
-    # -----------------------------------------------------
-    # Забираем файл с Telegram.
-    # -----------------------------------------------------
-
-    file_url = (
-        f"https://api.telegram.org/"
-        f"file/bot{BOT_TOKEN}/"
-        f"{file_path}"
-    )
-
     try:
 
-        response = requests.get(
-            file_url,
-            timeout=120
+        response = fetch_telegram_file(
+            item["file_id"]
         )
 
-    except requests.RequestException as exc:
+    except Exception as exc:
 
         return jsonify({
             "ok": False,
             "error":
-                f"Ошибка загрузки файла: {exc}"
-        }), 500
-
-    if response.status_code != 200:
-
-        return jsonify({
-            "ok": False,
-            "error":
-                "Telegram не отдал файл."
+                str(exc)
         }), 500
 
     content_type = (
-        "video/mp4"
-        if item["type"] == "video"
-        else "image/jpeg"
+        item["mime_type"]
+        or (
+            "video/mp4"
+            if item["type"] == "video"
+            else "image/jpeg"
+        )
     )
 
     return Response(
@@ -2256,7 +2443,7 @@ def album_media(album_id, position):
         content_type=content_type,
         headers={
             "Cache-Control":
-                "public, max-age=86400",
+                "public, max-age=3600",
             "Access-Control-Allow-Origin":
                 "*"
         }
@@ -2264,7 +2451,78 @@ def album_media(album_id, position):
 
 
 # =========================================================
-# УДАЛЕНИЕ АЛЬБОМА
+# DOWNLOAD
+# =========================================================
+
+@app.get(
+    "/albums/<int:album_id>/download/<int:position>"
+)
+def album_download(
+    album_id,
+    position
+):
+
+    item = get_album_item(
+        album_id,
+        position
+    )
+
+    if not item:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                "Страница не найдена."
+        }), 404
+
+    try:
+
+        response = fetch_telegram_file(
+            item["file_id"]
+        )
+
+    except Exception as exc:
+
+        return jsonify({
+            "ok": False,
+            "error":
+                str(exc)
+        }), 500
+
+    file_name = (
+        item["file_name"]
+        or f"page_{position}"
+    )
+
+    safe_name = (
+        file_name
+        .replace('"', "")
+        .replace("\r", "")
+        .replace("\n", "")
+    )
+
+    content_type = (
+        item["mime_type"]
+        or "application/octet-stream"
+    )
+
+    return Response(
+        response.content,
+        status=200,
+        content_type=content_type,
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{safe_name}"',
+            "Cache-Control":
+                "no-cache",
+            "Access-Control-Allow-Origin":
+                "https://web.telegram.org"
+        }
+    )
+
+
+# =========================================================
+# DELETE ALBUM
 # =========================================================
 
 @app.delete(
@@ -2276,14 +2534,13 @@ def delete_album(album_id):
 
         conn = get_db()
 
-        album = conn.execute(
-            """
+        album = conn.execute("""
             SELECT *
             FROM albums
             WHERE id = ?
-            """,
-            (album_id,)
-        ).fetchone()
+        """, (
+            album_id,
+        )).fetchone()
 
         if not album:
 
@@ -2295,23 +2552,19 @@ def delete_album(album_id):
                     "Альбом не найден."
             }), 404
 
-        # SQLite foreign_keys не всегда
-        # включен автоматически.
-        conn.execute(
-            """
+        conn.execute("""
             DELETE FROM album_items
             WHERE album_id = ?
-            """,
-            (album_id,)
-        )
+        """, (
+            album_id,
+        ))
 
-        conn.execute(
-            """
+        conn.execute("""
             DELETE FROM albums
             WHERE id = ?
-            """,
-            (album_id,)
-        )
+        """, (
+            album_id,
+        ))
 
         conn.commit()
         conn.close()
@@ -2322,7 +2575,7 @@ def delete_album(album_id):
 
 
 # =========================================================
-# ПУБЛИКАЦИЯ АЛЬБОМА В КАНАЛ
+# PUBLISH ALBUM
 # =========================================================
 
 @app.post(
@@ -2348,14 +2601,13 @@ def publish_album(album_id):
 
         conn = get_db()
 
-        album = conn.execute(
-            """
+        album = conn.execute("""
             SELECT *
             FROM albums
             WHERE id = ?
-            """,
-            (album_id,)
-        ).fetchone()
+        """, (
+            album_id,
+        )).fetchone()
 
         if not album:
 
@@ -2367,20 +2619,17 @@ def publish_album(album_id):
                     "Альбом не найден."
             }), 404
 
-        first_item = conn.execute(
-            """
-            SELECT *
+        count = conn.execute("""
+            SELECT COUNT(*)
             FROM album_items
             WHERE album_id = ?
-            ORDER BY position ASC
-            LIMIT 1
-            """,
-            (album_id,)
-        ).fetchone()
+        """, (
+            album_id,
+        )).fetchone()[0]
 
         conn.close()
 
-    if not first_item:
+    if count == 0:
 
         return jsonify({
             "ok": False,
@@ -2389,87 +2638,54 @@ def publish_album(album_id):
         }), 400
 
     # -----------------------------------------------------
-    # Ссылка на конкретный альбом.
-    #
-    # Пока используем обычную HTTPS-ссылку.
-    # Позже сделаем красивый полноценный
-    # Mini App reader.
+    # MAIN MINI APP DEEP LINK
     # -----------------------------------------------------
 
     album_url = (
-        f"{MINI_APP_URL}"
-        f"?album={album_id}"
+        f"https://t.me/"
+        f"KawaiiChanAsserBot"
+        f"?startapp=album_{album_id}"
     )
-
-    caption_parts = []
 
     if custom_text:
-        caption_parts.append(
-            custom_text
-        )
 
-    elif album["description"]:
-        caption_parts.append(
-            album["description"]
-        )
+        caption = custom_text
 
-    caption_parts.append(
-        f"📖 <b>{album['title']}</b>"
-    )
-
-    caption = "\n\n".join(
-        caption_parts
-    )
-
-    # -----------------------------------------------------
-    # Отправляем первую страницу
-    # -----------------------------------------------------
-    publish_method = (
-        "sendPhoto"
-        if first_item["type"] == "photo"
-        else "sendVideo"
-    )
-
-    publish_payload = {
-        "chat_id":
-            CHANNEL_USERNAME,
-
-        "caption":
-            caption,
-
-        "parse_mode":
-            "HTML",
-
-        "disable_notification":
-            "false",
-
-        "reply_markup":
-            json.dumps({
-                "inline_keyboard": [[
-                    {
-                        "text":
-                            "📖 ОТКРЫТЬ ПОЛНЫЙ АЛЬБОМ",
-                        "url":
-                            album_url
-                    }
-                ]]
-            }, ensure_ascii=False)
-    }
-
-    if first_item["type"] == "photo":
-        publish_payload["photo"] = (
-            first_item["file_id"]
-        )
     else:
-        publish_payload["video"] = (
-            first_item["file_id"]
+
+        caption = (
+            f"📖 <b>{album['title']}</b>\n\n"
+            f"{album['description']}\n\n"
+            f"📚 Страниц: <b>{count}</b>\n\n"
+            f"👉 <a href=\"{album_url}\">"
+            f"Открыть полный альбом"
+            f"</a>"
+        )
+
+    # Если пользователь дал свой текст,
+    # ссылку всё равно добавляем.
+    if custom_text:
+
+        caption += (
+            f"\n\n📚 Страниц: <b>{count}</b>\n"
+            f"👉 <a href=\"{album_url}\">"
+            f"Читать полный альбом"
+            f"</a>"
         )
 
     result = telegram(
-        publish_method,
-        payload=publish_payload
+        "sendMessage",
+        payload={
+            "chat_id":
+                CHANNEL_USERNAME,
+            "text":
+                caption,
+            "parse_mode":
+                "HTML",
+            "disable_web_page_preview":
+                "false"
+        }
     )
-        
 
     if not result.get("ok"):
 
@@ -2491,42 +2707,35 @@ def publish_album(album_id):
 
         conn = get_db()
 
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE albums
             SET
                 published_message_id = ?,
                 status = 'published',
                 updated_at = ?
             WHERE id = ?
-            """,
-            (
-                message_id,
-                now_iso(),
-                album_id
-            )
-        )
+        """, (
+            message_id,
+            now_iso(),
+            album_id
+        ))
 
         conn.commit()
         conn.close()
 
     return jsonify({
-
         "ok": True,
-
         "album_id":
             album_id,
-
         "message_id":
             message_id,
-
         "album_url":
             album_url
     })
 
 
 # =========================================================
-# ЗАПУСК ПЛАНИРОВЩИКА
+# START SCHEDULER
 # =========================================================
 
 def start_scheduler():
@@ -2540,8 +2749,10 @@ def start_scheduler():
 
 
 start_scheduler()
+
+
 # =========================================================
-# ЗАПУСК FLASK
+# FLASK
 # =========================================================
 
 if __name__ == "__main__":
@@ -2554,4 +2765,4 @@ if __name__ == "__main__":
                 "10000"
             )
         )
-)
+    )
