@@ -2058,19 +2058,27 @@ def create_album():
                     )
 
 
-                if file_size > MAX_ALBUM_FILE_SIZE:
-    raise RuntimeError(
-        f"Страница #{position} "
-        f"слишком большая. "
-        f"Максимум "
-        f"{MAX_ALBUM_FILE_SIZE // (1024 * 1024)} MB."
-    )
-
-
-                file_type = detect_file_type(
-                    filename,
-                    mime_type
+            if file_size <= 0:
+                raise RuntimeError(
+                    f"Страница #{position} пустая"
                 )
+
+            if file_size > MAX_ALBUM_FILE_SIZE:
+                raise RuntimeError(
+                    f"Страница #{position} "
+                    f"слишком большая. "
+                    f"Максимум {MAX_ALBUM_FILE_SIZE // (1024 * 1024)} MB."
+                )
+
+            file_type = detect_file_type(
+                filename,
+                mime_type
+            )
+
+    file_type = detect_file_type(
+    filename,
+    mime_type
+)
 
 
                 # --------------------------------------------
