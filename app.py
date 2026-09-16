@@ -2058,7 +2058,7 @@ def create_album():
                     )
 
 
-                f"f"Размер одного файла не должен превышать {MAX_ALBUM_FILE_SIZE // (1024 * 1024)} MB"
+                f"{MAX_ALBUM_FILE_SIZE // "
 
                     raise RuntimeError(
                         f"Страница #{position} "
