@@ -955,7 +955,7 @@ def publish():
                     uploaded_file
                 )
                 for uploaded_file in files
-            ]
+             ]
 
 
 # ============================================================
